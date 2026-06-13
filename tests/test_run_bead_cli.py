@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from uuid import uuid4
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -164,6 +165,10 @@ class RunBeadCliTest(unittest.TestCase):
             )
             self.assertEqual(project_manifest["repos"][0]["name"], "local/test")
             self.assertEqual(project_manifest["repos"][0]["path"], str(target_repo))
+            case_config = json.loads(
+                (state_dir / "case-data" / "config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(case_config["projects"], "./projects.json")
 
             fake_case_record = json.loads(
                 fake_case.with_suffix(".json").read_text(encoding="utf-8")
@@ -305,3 +310,76 @@ class RunBeadCliTest(unittest.TestCase):
                 fake_case.with_suffix(".json").read_text(encoding="utf-8")
             )
             self.assertIsNone(case_record["beads_password"])
+
+    def test_relative_state_dir_is_resolved_before_case_handoff(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            target_repo.mkdir()
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            state_dir = f".automation-simple/test-{uuid4().hex}"
+
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os",
+                        "from pathlib import Path",
+                        "Path(__file__).with_suffix('.json').write_text(json.dumps({",
+                        "  'case_data_dir': os.environ.get('CASE_DATA_DIR'),",
+                        "  'home': os.environ.get('HOME'),",
+                        "}) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+
+            bead_json = tmp_path / "bead.json"
+            bead_json.write_text(
+                json.dumps(
+                    {
+                        "id": "central-run.3",
+                        "title": "Resolve state dir",
+                        "description": "Use relative state dir.",
+                        "status": "open",
+                        "labels": ["project:automation", "ready-for-agent"],
+                        "metadata": {
+                            "afk_enabled": True,
+                            "afk_runner": "codex",
+                            "target_repo": "local/test",
+                            "target_repo_path": str(target_repo),
+                            "target_base_branch": "main",
+                            "branch_policy": "independent",
+                            "validation_command": "true",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.3",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                state_dir,
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            fake_case_record = json.loads(
+                fake_case.with_suffix(".json").read_text(encoding="utf-8")
+            )
+            expected_case_data_dir = str((REPO_ROOT / state_dir / "case-data").resolve())
+            self.assertEqual(fake_case_record["case_data_dir"], expected_case_data_dir)
+            self.assertEqual(
+                fake_case_record["home"], str(Path(expected_case_data_dir) / "home")
+            )

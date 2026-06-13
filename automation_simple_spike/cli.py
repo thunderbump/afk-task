@@ -71,6 +71,10 @@ def run_bead(
     beads_workspace: Path,
     beads_password_file: Path,
 ) -> int:
+    state_dir = state_dir.resolve()
+    case_checkout = case_checkout.resolve()
+    if case_data_dir is not None:
+        case_data_dir = case_data_dir.resolve()
     issue = load_issue(
         bead_id=bead_id,
         bead_json=bead_json,
@@ -84,7 +88,7 @@ def run_bead(
         return 1
 
     metadata = issue["metadata"]
-    target_repo = Path(str(metadata["target_repo_path"]))
+    target_repo = Path(str(metadata["target_repo_path"])).resolve()
     case_data = case_data_dir or state_dir / "case-data"
     review_branch = review_branch_for(bead_id=bead_id, metadata=metadata)
     task_md, task_json = write_case_task(
@@ -339,6 +343,10 @@ def write_case_projects_manifest(
     manifest["repos"] = repos
     projects_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (case_data_dir / "config.json").write_text(
+        json.dumps({"projects": "./projects.json"}, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return projects_path
