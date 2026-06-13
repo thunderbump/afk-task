@@ -1,0 +1,5 @@
+[project]
+name = "automation-simple-spike"
+version = "0.1.0"
+description = "Throwaway spike for a Beads -> Case -> Sandcastle automation shape."
+requires-python = ">=3.11"

@@ -1,0 +1,1 @@
+"""Throwaway automation architecture spike."""
