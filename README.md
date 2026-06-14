@@ -29,6 +29,21 @@ To pass a Case runtime adapter module through to native Case, pass:
 python3 -m automation_simple_spike run --bead <bead-id> --case-runtime-module <path>
 ```
 
+This repo includes one local proof module:
+
+```sh
+python3 -m automation_simple_spike run \
+  --bead central-hmd.5 \
+  --case-runtime-module runtime_modules/host-monitor-dashboard-runtime.mjs
+```
+
+`runtime_modules/host-monitor-dashboard-runtime.mjs` exports
+`createCaseRuntime()` for native Case's `--runtime-module` seam. Its
+implementer phase writes a tiny Python/static HTML dashboard fixture into the
+target repo cwd, its verifier phase runs
+`python3 -m unittest discover -s tests`, and every spawn appends evidence to
+`<target_repo>/.case/runtime-module-spawns.log`.
+
 By default the command reads central Beads with:
 
 ```sh
