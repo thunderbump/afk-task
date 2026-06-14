@@ -117,13 +117,17 @@ def run_bead(
         case_data_dir=case_data,
         task_json=task_json,
     )
-    write_case_command_result(request_path.parent, result)
-    if result.returncode != 0:
+    interpreted_returncode = interpreted_case_returncode(result)
+    write_case_command_result(request_path.parent, result, interpreted_returncode)
+    if interpreted_returncode != 0:
+        if result.returncode == 0:
+            print("run-bead failed: Case pipeline reported failure", file=sys.stderr)
+            return interpreted_returncode
         print(
             f"run-bead failed: Case command exited {result.returncode}",
             file=sys.stderr,
         )
-        return result.returncode
+        return interpreted_returncode
 
     print(f"run-bead handed off: {bead_id}")
     print(f"Case task JSON: {task_json}")
@@ -430,15 +434,40 @@ def run_case_command(
 
 
 def write_case_command_result(
-    run_dir: Path, result: subprocess.CompletedProcess[str]
+    run_dir: Path,
+    result: subprocess.CompletedProcess[str],
+    interpreted_returncode: int | None = None,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "case-stdout.txt").write_text(result.stdout, encoding="utf-8")
     (run_dir / "case-stderr.txt").write_text(result.stderr, encoding="utf-8")
     (run_dir / "case-result.json").write_text(
-        json.dumps({"exit_code": result.returncode}, indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            {
+                "exit_code": result.returncode,
+                "interpreted_exit_code": (
+                    result.returncode
+                    if interpreted_returncode is None
+                    else interpreted_returncode
+                ),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
+
+
+def interpreted_case_returncode(result: subprocess.CompletedProcess[str]) -> int:
+    if result.returncode != 0:
+        return result.returncode
+    output = f"{result.stdout}\n{result.stderr}"
+    if "Pipeline failed at " in output:
+        return 1
+    if '"msg":"pipeline finished"' in output and '"outcome":"failed"' in output:
+        return 1
+    return 0
 
 
 def make_run_id(bead_id: str) -> str:

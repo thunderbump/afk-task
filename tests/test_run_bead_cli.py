@@ -199,6 +199,73 @@ class RunBeadCliTest(unittest.TestCase):
                 "scaffolded",
             )
 
+    def test_case_pipeline_failure_output_makes_run_fail_even_with_zero_exit(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            target_repo.mkdir()
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "print('Pipeline failed at implementer phase.')",
+                        "raise SystemExit(0)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            bead_json.write_text(
+                json.dumps(
+                    {
+                        "id": "central-run.4",
+                        "title": "Surface Case failure",
+                        "description": "Treat failed Case pipelines as failed runs.",
+                        "status": "open",
+                        "labels": ["project:automation", "ready-for-agent"],
+                        "metadata": {
+                            "afk_enabled": True,
+                            "afk_runner": "codex",
+                            "target_repo": "local/test",
+                            "target_repo_path": str(target_repo),
+                            "target_base_branch": "main",
+                            "branch_policy": "independent",
+                            "validation_command": "true",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.4",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("Case pipeline reported failure", result.stderr)
+            run_results = list(state_dir.glob("runs/*/case-result.json"))
+            self.assertEqual(len(run_results), 1)
+            case_result = json.loads(run_results[0].read_text(encoding="utf-8"))
+            self.assertEqual(case_result["exit_code"], 0)
+            self.assertEqual(case_result["interpreted_exit_code"], 1)
+
     def test_can_load_bead_through_fake_bd_without_leaking_password_to_case(
         self,
     ) -> None:
