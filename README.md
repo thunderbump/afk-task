@@ -23,6 +23,12 @@ agents, pass:
 python3 -m automation_simple_spike run --bead <bead-id> --case-dry-run
 ```
 
+To pass a Case runtime adapter module through to native Case, pass:
+
+```sh
+python3 -m automation_simple_spike run --bead <bead-id> --case-runtime-module <path>
+```
+
 By default the command reads central Beads with:
 
 ```sh
@@ -62,10 +68,13 @@ bun src/index.ts run --task <task-json> --mode unattended
 
 with `CASE_DATA_DIR`, `XDG_CONFIG_HOME`, and `HOME` pointed at the spike-owned
 Case data dir. Beads environment variables are removed before invoking Case.
-When `--case-dry-run` is passed, the command appends Case's native `--dry-run`
-flag. If native Case mutates the generated task JSON during dry-run, the spike
-archives that native copy in the run directory as `native-dry-run-task.json` and
-restores the generated task JSON in the target repo.
+When `--case-runtime-module <path>` is passed, the command appends Case's native
+`--runtime-module <path>` flag and records the resolved path in
+`execution-request.json`. When `--case-dry-run` is passed, the command appends
+Case's native `--dry-run` flag. If native Case mutates the generated task JSON
+during dry-run, the spike archives that native copy in the run directory as
+`native-dry-run-task.json` and restores the generated task JSON in the target
+repo.
 
 ## Cron Shape
 
