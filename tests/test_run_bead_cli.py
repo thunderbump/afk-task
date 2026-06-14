@@ -199,6 +199,96 @@ class RunBeadCliTest(unittest.TestCase):
                 "scaffolded",
             )
 
+    def test_case_dry_run_flag_is_passed_to_case_command(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            target_repo.mkdir()
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, sys",
+                        "from pathlib import Path",
+                        "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "}) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            bead_json.write_text(
+                json.dumps(
+                    {
+                        "id": "central-run.5",
+                        "title": "Dry-run Case handoff",
+                        "description": "Use native Case dry-run.",
+                        "status": "open",
+                        "labels": ["project:automation", "ready-for-agent"],
+                        "metadata": {
+                            "afk_enabled": True,
+                            "afk_runner": "codex",
+                            "target_repo": "local/test",
+                            "target_repo_path": str(target_repo),
+                            "target_base_branch": "main",
+                            "branch_policy": "independent",
+                            "validation_command": "true",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.5",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--case-dry-run",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            fake_case_record = json.loads(
+                fake_case.with_suffix(".json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                fake_case_record["argv"],
+                [
+                    "src/index.ts",
+                    "run",
+                    "--task",
+                    str(
+                        target_repo
+                        / ".case"
+                        / "tasks"
+                        / "active"
+                        / "central-run.5.task.json"
+                    ),
+                    "--mode",
+                    "unattended",
+                    "--dry-run",
+                ],
+            )
+            execution_request = json.loads(
+                next(state_dir.glob("runs/*/execution-request.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(execution_request["case_dry_run"])
+
     def test_case_pipeline_failure_output_makes_run_fail_even_with_zero_exit(
         self,
     ) -> None:

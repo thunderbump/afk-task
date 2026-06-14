@@ -16,6 +16,13 @@ boundaries.
 python3 -m automation_simple_spike run --bead <bead-id>
 ```
 
+For a bounded native Case plumbing test that does not spawn model-backed phase
+agents, pass:
+
+```sh
+python3 -m automation_simple_spike run --bead <bead-id> --case-dry-run
+```
+
 By default the command reads central Beads with:
 
 ```sh
@@ -55,6 +62,8 @@ bun src/index.ts run --task <task-json> --mode unattended
 
 with `CASE_DATA_DIR`, `XDG_CONFIG_HOME`, and `HOME` pointed at the spike-owned
 Case data dir. Beads environment variables are removed before invoking Case.
+When `--case-dry-run` is passed, the command appends Case's native `--dry-run`
+flag.
 
 ## Cron Shape
 
@@ -159,4 +168,4 @@ branch, validation, PR, and comment creation for these Beads-driven tasks.
 - Map Case final status, PR URL, PR number, and comments back to Beads metadata.
 - Add host-side locking or Beads `active_run_id` mutation around cron execution.
 - Add task selection for `ready-for-agent` beads instead of only `--bead`.
-- Run a bounded real Case dry-run, then a real Sandcastle-backed Case run.
+- Run a real Sandcastle-backed Case run.

@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     run.add_argument("--case-data-dir")
     run.add_argument("--case-command", default="bun")
+    run.add_argument("--case-dry-run", action="store_true")
     run.add_argument("--bd-command", default="bd")
     run.add_argument("--beads-workspace", default="/home/bump/Projects/beads")
     run.add_argument(
@@ -51,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
             case_checkout=Path(args.case_checkout),
             case_data_dir=Path(args.case_data_dir) if args.case_data_dir else None,
             case_command=args.case_command,
+            case_dry_run=args.case_dry_run,
             bd_command=args.bd_command,
             beads_workspace=Path(args.beads_workspace),
             beads_password_file=Path(args.beads_password_file),
@@ -67,6 +69,7 @@ def run_bead(
     case_checkout: Path,
     case_data_dir: Path | None,
     case_command: str,
+    case_dry_run: bool,
     bd_command: str,
     beads_workspace: Path,
     beads_password_file: Path,
@@ -110,12 +113,14 @@ def run_bead(
         case_checkout=case_checkout,
         case_data_dir=case_data,
         review_branch=review_branch,
+        case_dry_run=case_dry_run,
     )
     result = run_case_command(
         case_command=case_command,
         case_checkout=case_checkout,
         case_data_dir=case_data,
         task_json=task_json,
+        case_dry_run=case_dry_run,
     )
     interpreted_returncode = interpreted_case_returncode(result)
     write_case_command_result(request_path.parent, result, interpreted_returncode)
@@ -365,6 +370,7 @@ def write_execution_request(
     case_checkout: Path,
     case_data_dir: Path,
     review_branch: str,
+    case_dry_run: bool,
 ) -> Path:
     metadata = issue["metadata"]
     run_dir = state_dir / "runs" / make_run_id(str(issue["id"]))
@@ -376,6 +382,7 @@ def write_execution_request(
                 "bead_id": issue["id"],
                 "case_checkout": str(case_checkout),
                 "case_data_dir": str(case_data_dir),
+                "case_dry_run": case_dry_run,
                 "case_task_json": str(task_json),
                 "case_task_markdown": str(task_md),
                 "target_repo": metadata["target_repo"],
@@ -407,6 +414,7 @@ def run_case_command(
     case_checkout: Path,
     case_data_dir: Path,
     task_json: Path,
+    case_dry_run: bool,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for key in ("BEADS_DIR", "BEADS_DOLT_PASSWORD", "AUTOMATION_BEADS_WORKSPACE"):
@@ -414,16 +422,19 @@ def run_case_command(
     env["CASE_DATA_DIR"] = str(case_data_dir)
     env["XDG_CONFIG_HOME"] = str(case_data_dir / "config-home")
     env["HOME"] = str(case_data_dir / "home")
+    command = [
+        case_command,
+        "src/index.ts",
+        "run",
+        "--task",
+        str(task_json),
+        "--mode",
+        "unattended",
+    ]
+    if case_dry_run:
+        command.append("--dry-run")
     return subprocess.run(
-        [
-            case_command,
-            "src/index.ts",
-            "run",
-            "--task",
-            str(task_json),
-            "--mode",
-            "unattended",
-        ],
+        command,
         cwd=case_checkout,
         env=env,
         text=True,
