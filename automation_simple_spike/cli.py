@@ -115,6 +115,7 @@ def run_bead(
         review_branch=review_branch,
         case_dry_run=case_dry_run,
     )
+    generated_task_json = task_json.read_text(encoding="utf-8") if case_dry_run else None
     result = run_case_command(
         case_command=case_command,
         case_checkout=case_checkout,
@@ -122,6 +123,12 @@ def run_bead(
         task_json=task_json,
         case_dry_run=case_dry_run,
     )
+    if case_dry_run and generated_task_json is not None:
+        preserve_native_dry_run_task(
+            run_dir=request_path.parent,
+            task_json=task_json,
+            generated_task_json=generated_task_json,
+        )
     interpreted_returncode = interpreted_case_returncode(result)
     write_case_command_result(request_path.parent, result, interpreted_returncode)
     if interpreted_returncode != 0:
@@ -468,6 +475,21 @@ def write_case_command_result(
         + "\n",
         encoding="utf-8",
     )
+
+
+def preserve_native_dry_run_task(
+    *,
+    run_dir: Path,
+    task_json: Path,
+    generated_task_json: str,
+) -> None:
+    native_task_json = task_json.read_text(encoding="utf-8")
+    if native_task_json != generated_task_json:
+        (run_dir / "native-dry-run-task.json").write_text(
+            native_task_json,
+            encoding="utf-8",
+        )
+        task_json.write_text(generated_task_json, encoding="utf-8")
 
 
 def interpreted_case_returncode(result: subprocess.CompletedProcess[str]) -> int:

@@ -289,6 +289,88 @@ class RunBeadCliTest(unittest.TestCase):
             )
             self.assertTrue(execution_request["case_dry_run"])
 
+    def test_case_dry_run_archives_native_task_mutation_and_restores_generated_task(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            target_repo.mkdir()
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, sys",
+                        "from pathlib import Path",
+                        "task = Path(sys.argv[sys.argv.index('--task') + 1])",
+                        "payload = json.loads(task.read_text(encoding='utf-8'))",
+                        "payload['status'] = 'pr-opened'",
+                        "payload['tested'] = True",
+                        "payload['prUrl'] = None",
+                        "task.write_text(json.dumps(payload) + '\\n', encoding='utf-8')",
+                        "print('Pipeline completed successfully.')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            bead_json.write_text(
+                json.dumps(
+                    {
+                        "id": "central-run.6",
+                        "title": "Restore dry-run task",
+                        "description": "Dry-run should not leave lifecycle state.",
+                        "status": "open",
+                        "labels": ["project:automation", "ready-for-agent"],
+                        "metadata": {
+                            "afk_enabled": True,
+                            "afk_runner": "codex",
+                            "target_repo": "local/test",
+                            "target_repo_path": str(target_repo),
+                            "target_base_branch": "main",
+                            "branch_policy": "independent",
+                            "validation_command": "true",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.6",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--case-dry-run",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            task_json_path = (
+                target_repo / ".case" / "tasks" / "active" / "central-run.6.task.json"
+            )
+            restored_task = json.loads(task_json_path.read_text(encoding="utf-8"))
+            self.assertEqual(restored_task["status"], "active")
+            self.assertFalse(restored_task["tested"])
+            self.assertIsNone(restored_task["prUrl"])
+
+            native_task_paths = list(state_dir.glob("runs/*/native-dry-run-task.json"))
+            self.assertEqual(len(native_task_paths), 1)
+            native_task = json.loads(native_task_paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(native_task["status"], "pr-opened")
+            self.assertTrue(native_task["tested"])
+
     def test_case_pipeline_failure_output_makes_run_fail_even_with_zero_exit(
         self,
     ) -> None:

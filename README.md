@@ -63,7 +63,9 @@ bun src/index.ts run --task <task-json> --mode unattended
 with `CASE_DATA_DIR`, `XDG_CONFIG_HOME`, and `HOME` pointed at the spike-owned
 Case data dir. Beads environment variables are removed before invoking Case.
 When `--case-dry-run` is passed, the command appends Case's native `--dry-run`
-flag.
+flag. If native Case mutates the generated task JSON during dry-run, the spike
+archives that native copy in the run directory as `native-dry-run-task.json` and
+restores the generated task JSON in the target repo.
 
 ## Cron Shape
 
