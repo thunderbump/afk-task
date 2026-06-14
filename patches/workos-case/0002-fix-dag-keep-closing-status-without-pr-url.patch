@@ -1,0 +1,166 @@
+From a8150d52f1c13f282fdf2a6c50d8df76330c8dbe Mon Sep 17 00:00:00 2001
+From: Nick Nisi <nick.nisi@workos.com>
+Date: Sat, 13 Jun 2026 23:33:58 -0700
+Subject: [PATCH 2/2] fix(dag): keep closing status without pr url
+
+---
+ src/__tests__/dag-status.spec.ts         | 41 ++++++++++++++++++++++++
+ src/__tests__/run-runtime-module.spec.ts | 30 ++++++++++++++---
+ src/dag/status.ts                        |  2 ++
+ 3 files changed, 68 insertions(+), 5 deletions(-)
+
+diff --git a/src/__tests__/dag-status.spec.ts b/src/__tests__/dag-status.spec.ts
+index e6bf912..4b7c22f 100644
+--- a/src/__tests__/dag-status.spec.ts
++++ b/src/__tests__/dag-status.spec.ts
+@@ -1,6 +1,7 @@
+ import { describe, test, expect } from 'bun:test';
+ import { projectStatusFromGraph } from '../dag/status.js';
+ import { buildGraph } from '../dag/builder.js';
++import type { AgentResult } from '../types.js';
+ import type { PipelineGraph, DagNode } from '../dag/types.js';
+ 
+ function setNodeState(graph: PipelineGraph, nodeId: string, state: DagNode['state']) {
+@@ -9,6 +10,29 @@ function setNodeState(graph: PipelineGraph, nodeId: string, state: DagNode['stat
+   node.state = state;
+ }
+ 
++function setNodeResult(graph: PipelineGraph, nodeId: string, result: AgentResult) {
++  const node = graph.nodes.get(nodeId);
++  if (!node) throw new Error(`Node ${nodeId} not found`);
++  node.result = result;
++}
++
++function completedResult(prUrl: string | null): AgentResult {
++  return {
++    status: 'completed',
++    summary: prUrl ? 'PR created' : 'Close completed without a PR URL',
++    artifacts: {
++      commit: null,
++      filesChanged: [],
++      testsPassed: null,
++      screenshotUrls: [],
++      evidenceMarkers: [],
++      prUrl,
++      prNumber: prUrl ? 42 : null,
++    },
++    error: null,
++  };
++}
++
+ describe('projectStatusFromGraph', () => {
+   test('returns active when no nodes are running and first node is pending', () => {
+     const graph = buildGraph('standard', 2);
+@@ -66,6 +90,7 @@ describe('projectStatusFromGraph', () => {
+     setNodeState(graph, 'verify_0', 'completed');
+     setNodeState(graph, 'review_0', 'completed');
+     setNodeState(graph, 'close', 'completed');
++    setNodeResult(graph, 'close', completedResult('https://github.com/org/repo/pull/42'));
+     // skip unused revision nodes
+     for (let c = 1; c <= 2; c++) {
+       setNodeState(graph, `implement_${c}`, 'skipped');
+@@ -75,6 +100,22 @@ describe('projectStatusFromGraph', () => {
+     expect(projectStatusFromGraph(graph)).toBe('pr-opened');
+   });
+ 
++  test('returns closing when close completed without a PR URL', () => {
++    const graph = buildGraph('standard', 2);
++    setNodeState(graph, 'implement_0', 'completed');
++    setNodeState(graph, 'verify_0', 'completed');
++    setNodeState(graph, 'review_0', 'completed');
++    setNodeState(graph, 'close', 'completed');
++    setNodeResult(graph, 'close', completedResult(null));
++    // skip unused revision nodes
++    for (let c = 1; c <= 2; c++) {
++      setNodeState(graph, `implement_${c}`, 'skipped');
++      setNodeState(graph, `verify_${c}`, 'skipped');
++      setNodeState(graph, `review_${c}`, 'skipped');
++    }
++    expect(projectStatusFromGraph(graph)).toBe('closing');
++  });
++
+   test('returns merged when all nodes are completed/skipped', () => {
+     const graph = buildGraph('standard', 2);
+     setNodeState(graph, 'scout_0', 'completed');
+diff --git a/src/__tests__/run-runtime-module.spec.ts b/src/__tests__/run-runtime-module.spec.ts
+index c07223f..b5cff94 100644
+--- a/src/__tests__/run-runtime-module.spec.ts
++++ b/src/__tests__/run-runtime-module.spec.ts
+@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'bun:test';
+ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
++import type { TaskJson } from '../types.js';
+ 
+ const expectedSpawns = ['scout', 'implementer', 'verifier', 'reviewer', 'closer', 'retrospective', ''].join('\n');
+ const tempRoots: string[] = [];
+@@ -14,21 +15,37 @@ describe('run --runtime-module', () => {
+   it('runs a task through a named createCaseRuntime export without Pi', async () => {
+     await expect(
+       runTaskWithRuntimeModule('export function createCaseRuntime() { return createRuntime(); }'),
+-    ).resolves.toBe(expectedSpawns);
++    ).resolves.toMatchObject({
++      runtimeLog: expectedSpawns,
++    });
+   });
+ 
+   it('runs a task through a default runtime factory without Pi', async () => {
+     await expect(
+       runTaskWithRuntimeModule('export default function createDefaultRuntime() { return createRuntime(); }'),
+-    ).resolves.toBe(expectedSpawns);
++    ).resolves.toMatchObject({
++      runtimeLog: expectedSpawns,
++    });
+   });
+ 
+   it('runs a task through a default runtime object without Pi', async () => {
+-    await expect(runTaskWithRuntimeModule('export default createRuntime();')).resolves.toBe(expectedSpawns);
++    await expect(runTaskWithRuntimeModule('export default createRuntime();')).resolves.toMatchObject({
++      runtimeLog: expectedSpawns,
++    });
++  });
++
++  it('keeps task status closing when runtime close succeeds without a PR URL', async () => {
++    const result = await runTaskWithRuntimeModule('export default createRuntime();');
++
++    expect(result.taskJson).toMatchObject({
++      status: 'closing',
++      prUrl: null,
++      prNumber: null,
++    });
+   });
+ });
+ 
+-async function runTaskWithRuntimeModule(exportSource: string): Promise<string> {
++async function runTaskWithRuntimeModule(exportSource: string): Promise<{ runtimeLog: string; taskJson: TaskJson }> {
+   const root = await mkdtemp(join(tmpdir(), 'case-runtime-module-'));
+   tempRoots.push(root);
+ 
+@@ -128,7 +145,10 @@ async function runTaskWithRuntimeModule(exportSource: string): Promise<string> {
+   clearTimeout(timer);
+ 
+   expect({ exitCode, stdout, stderr }).toMatchObject({ exitCode: 0 });
+-  return readFile(runtimeLogPath, 'utf-8');
++  return {
++    runtimeLog: await readFile(runtimeLogPath, 'utf-8'),
++    taskJson: JSON.parse(await readFile(taskJsonPath, 'utf-8')),
++  };
+ }
+ 
+ function runtimeModuleSource(exportSource: string): string {
+diff --git a/src/dag/status.ts b/src/dag/status.ts
+index adbbd3f..eeee73b 100644
+--- a/src/dag/status.ts
++++ b/src/dag/status.ts
+@@ -40,6 +40,8 @@ export function projectStatusFromGraph(graph: PipelineGraph): TaskStatus {
+   // Close completed
+   const closeNode = graph.nodes.get('close');
+   if (closeNode?.state === 'completed') {
++    if (closeNode.result && !closeNode.result.artifacts.prUrl) return 'closing';
++
+     // Check if all nodes are done
+     let allDone = true;
+     for (const [, node] of graph.nodes) {
+-- 
+2.43.0
+

@@ -44,6 +44,16 @@ target repo cwd, its verifier phase runs
 `python3 -m unittest discover -s tests`, and every spawn appends evidence to
 `<target_repo>/.case/runtime-module-spawns.log`.
 
+The Case side of this proof currently lives as a local patch series, not a fork:
+
+```sh
+scripts/apply-case-patches.sh
+```
+
+By default the script applies `patches/workos-case/*.patch` to
+`/home/bump/Projects/automation/.automation/cache/workos-case`. Set
+`CASE_CHECKOUT=/path/to/case` to apply it elsewhere.
+
 By default the command reads central Beads with:
 
 ```sh
@@ -140,6 +150,12 @@ interface CaseAgentRuntime {
 Case currently defaults to `PiRuntimeAdapter`. A Sandcastle adapter can satisfy
 the same interface and call Sandcastle from each Case phase.
 
+The local Case patches add `run --runtime-module <path>`, which dynamically
+imports a module exporting `createCaseRuntime()`, a default runtime factory, or
+a default runtime object. They also keep task status at `closing` when the close
+phase completes without a PR URL. Pi remains the default runtime when no module
+is supplied.
+
 ## Sandcastle Findings
 
 Sandcastle's normal API is one `run()` call:
@@ -188,7 +204,8 @@ branch, validation, PR, and comment creation for these Beads-driven tasks.
 ## Remaining Gaps
 
 - Implement and compile the real Case `SandcastleRuntimeAdapter`.
-- Decide how to inject the adapter into native Case without maintaining a fork.
+- Decide whether to upstream Case `--runtime-module` or keep carrying the local
+  patch process in `patches/workos-case/`.
 - Confirm Case can create/use the intended review branch for both branch
   policies.
 - Map Case final status, PR URL, PR number, and comments back to Beads metadata.

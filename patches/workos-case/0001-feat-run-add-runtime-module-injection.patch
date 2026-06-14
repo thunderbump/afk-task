@@ -1,0 +1,281 @@
+From 2787a4a784dd259f32f2deeee73d793344ffe826 Mon Sep 17 00:00:00 2001
+From: Nick Nisi <nick.nisi@workos.com>
+Date: Sat, 13 Jun 2026 23:19:52 -0700
+Subject: [PATCH 1/2] feat(run): add runtime module injection
+
+---
+ src/__tests__/run-runtime-module.spec.ts | 187 +++++++++++++++++++++++
+ src/commands/run.ts                      |  33 ++++
+ 2 files changed, 220 insertions(+)
+ create mode 100644 src/__tests__/run-runtime-module.spec.ts
+
+diff --git a/src/__tests__/run-runtime-module.spec.ts b/src/__tests__/run-runtime-module.spec.ts
+new file mode 100644
+index 0000000..c07223f
+--- /dev/null
++++ b/src/__tests__/run-runtime-module.spec.ts
+@@ -0,0 +1,187 @@
++import { afterEach, describe, expect, it } from 'bun:test';
++import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++
++const expectedSpawns = ['scout', 'implementer', 'verifier', 'reviewer', 'closer', 'retrospective', ''].join('\n');
++const tempRoots: string[] = [];
++
++afterEach(async () => {
++  await Promise.all(tempRoots.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
++});
++
++describe('run --runtime-module', () => {
++  it('runs a task through a named createCaseRuntime export without Pi', async () => {
++    await expect(
++      runTaskWithRuntimeModule('export function createCaseRuntime() { return createRuntime(); }'),
++    ).resolves.toBe(expectedSpawns);
++  });
++
++  it('runs a task through a default runtime factory without Pi', async () => {
++    await expect(
++      runTaskWithRuntimeModule('export default function createDefaultRuntime() { return createRuntime(); }'),
++    ).resolves.toBe(expectedSpawns);
++  });
++
++  it('runs a task through a default runtime object without Pi', async () => {
++    await expect(runTaskWithRuntimeModule('export default createRuntime();')).resolves.toBe(expectedSpawns);
++  });
++});
++
++async function runTaskWithRuntimeModule(exportSource: string): Promise<string> {
++  const root = await mkdtemp(join(tmpdir(), 'case-runtime-module-'));
++  tempRoots.push(root);
++
++  const caseDataDir = join(root, 'case-data');
++  const targetRepo = join(root, 'target-repo');
++  const taskDir = join(targetRepo, '.case', 'tasks', 'active');
++  const taskJsonPath = join(taskDir, 'fixture-1.task.json');
++  const taskMdPath = join(taskDir, 'fixture-1.md');
++  const runtimeLogPath = join(root, 'runtime-spawns.txt');
++  const runtimeModulePath = join(root, 'fake-runtime.ts');
++
++  await mkdir(caseDataDir, { recursive: true });
++  await mkdir(taskDir, { recursive: true });
++  await writeFile(join(targetRepo, 'README.md'), '# fixture\n');
++  await writeFile(
++    join(caseDataDir, 'config.json'),
++    JSON.stringify({ version: 1, projects: './projects.json' }, null, 2) + '\n',
++  );
++  await writeFile(
++    join(caseDataDir, 'projects.json'),
++    JSON.stringify(
++      {
++        repos: [
++          {
++            name: 'fixture',
++            evidenceStrategy: 'test-output',
++            path: targetRepo,
++            remote: 'https://example.test/fixture.git',
++            description: 'runtime module fixture',
++            language: 'TypeScript',
++            packageManager: 'bun',
++            commands: { test: 'bun test' },
++          },
++        ],
++      },
++      null,
++      2,
++    ) + '\n',
++  );
++  await writeFile(
++    taskJsonPath,
++    JSON.stringify(
++      {
++        id: 'fixture-1',
++        status: 'active',
++        created: '2026-06-13T00:00:00Z',
++        repo: 'fixture',
++        issue: 'Complete through fake runtime',
++        issueType: 'freeform',
++        agents: {},
++        tested: false,
++        manualTested: false,
++        prUrl: null,
++        prNumber: null,
++      },
++      null,
++      2,
++    ) + '\n',
++  );
++  await writeFile(taskMdPath, '# Complete through fake runtime\n');
++  await writeFile(runtimeModulePath, runtimeModuleSource(exportSource));
++
++  const proc = Bun.spawn(
++    [
++      'bun',
++      'src/index.ts',
++      'run',
++      '--task',
++      taskJsonPath,
++      '--mode',
++      'unattended',
++      '--runtime-module',
++      runtimeModulePath,
++    ],
++    {
++      cwd: process.cwd(),
++      env: {
++        ...process.env,
++        CASE_DATA_DIR: caseDataDir,
++        CASE_PACKAGE_ROOT: process.cwd(),
++        CASE_MODEL_OVERRIDE: 'missing-test-model',
++        CASE_SCOUT_TIMEOUT_MS: '1000',
++        HOME: join(root, 'home'),
++        RUNTIME_LOG_PATH: runtimeLogPath,
++        NO_COLOR: '1',
++      },
++      stdout: 'pipe',
++      stderr: 'pipe',
++    },
++  );
++  const timer = setTimeout(() => proc.kill(), 20_000);
++  const [stdout, stderr, exitCode] = await Promise.all([
++    new Response(proc.stdout).text(),
++    new Response(proc.stderr).text(),
++    proc.exited,
++  ]);
++  clearTimeout(timer);
++
++  expect({ exitCode, stdout, stderr }).toMatchObject({ exitCode: 0 });
++  return readFile(runtimeLogPath, 'utf-8');
++}
++
++function runtimeModuleSource(exportSource: string): string {
++  return `
++import { appendFileSync } from 'node:fs';
++
++const artifacts = {
++  commit: 'fake-runtime',
++  filesChanged: [],
++  testsPassed: true,
++  screenshotUrls: [],
++  evidenceMarkers: [],
++  prUrl: null,
++  prNumber: null,
++};
++
++function agentResult(agentName) {
++  const result = {
++    status: 'completed',
++    summary: agentName + ' completed through fake runtime',
++    artifacts,
++    error: null,
++  };
++
++  if (agentName === 'scout') {
++    result.findings = {
++      relevantFiles: [],
++      patterns: [],
++      constraints: [],
++    };
++  }
++
++  return result;
++}
++
++function createRuntime() {
++  return {
++    async spawn(options) {
++      appendFileSync(process.env.RUNTIME_LOG_PATH, options.agentName + '\\n');
++      const result = agentResult(options.agentName);
++      return {
++        raw: '<<<AGENT_RESULT\\n' + JSON.stringify({ result, scoutFindings: result.findings }) + '\\nAGENT_RESULT>>>',
++        result,
++        durationMs: 1,
++      };
++    },
++    createTools() {
++      return [];
++    },
++    abort() {},
++  };
++}
++
++${exportSource}
++`;
++}
+diff --git a/src/commands/run.ts b/src/commands/run.ts
+index 75ec91c..2d128ea 100644
+--- a/src/commands/run.ts
++++ b/src/commands/run.ts
+@@ -1,4 +1,6 @@
+ import { parseArgs } from 'node:util';
++import { resolve } from 'node:path';
++import { pathToFileURL } from 'node:url';
+ import { buildPipelineConfig } from '../config.js';
+ import { runPipeline } from '../pipeline.js';
+ import { runCliOrchestrator } from '../entry/cli-orchestrator.js';
+@@ -6,6 +8,7 @@ import { startOrchestratorSession } from '../agent/orchestrator-session.js';
+ import { createLogger } from '../util/logger.js';
+ import { resolvePackageRoot } from '../paths.js';
+ import type { PipelineMode } from '../types.js';
++import type { CaseAgentRuntime } from '../agent/runtime.js';
+ 
+ const log = createLogger();
+ 
+@@ -32,6 +35,7 @@ export async function handler(argv: string[]): Promise<number> {
+       agent: { type: 'boolean' },
+       model: { type: 'string' },
+       'dry-run': { type: 'boolean' },
++      'runtime-module': { type: 'string' },
+       fresh: { type: 'boolean' },
+       tui: { type: 'boolean' },
+     },
+@@ -111,6 +115,7 @@ Options:
+   --task, -t <file>       Run an existing task JSON file directly
+   --agent                 Start an interactive steering session
+   --model <model>         Override model for all agents in this run
++  --runtime-module <path> Import a CaseAgentRuntime factory/object for --task runs
+   --mode, -m <mode>       "attended" (default) or "unattended"
+   --dry-run               Validate without spawning agents
+   --fresh                 Ignore existing task state and start clean
+@@ -140,6 +145,10 @@ async function runTaskFlow(values: Record<string, unknown>): Promise<number> {
+       dryRun: values['dry-run'] as boolean | undefined,
+     });
+ 
++    if (values['runtime-module']) {
++      config.runtime = await loadRuntimeModule(values['runtime-module'] as string);
++    }
++
+     if (values.tui) {
+       config.renderer = 'tui';
+     }
+@@ -153,3 +162,27 @@ async function runTaskFlow(values: Record<string, unknown>): Promise<number> {
+     return 1;
+   }
+ }
++
++async function loadRuntimeModule(path: string): Promise<CaseAgentRuntime> {
++  const mod = await import(pathToFileURL(resolve(path)).href);
++  const exported = typeof mod.createCaseRuntime === 'function' ? mod.createCaseRuntime : mod.default;
++  const runtime = typeof exported === 'function' ? await exported() : exported;
++
++  if (!isCaseAgentRuntime(runtime)) {
++    throw new Error(
++      `Runtime module must export createCaseRuntime() or a default factory/object compatible with CaseAgentRuntime: ${path}`,
++    );
++  }
++
++  return runtime;
++}
++
++function isCaseAgentRuntime(value: unknown): value is CaseAgentRuntime {
++  if (typeof value !== 'object' || value === null) return false;
++  const runtime = value as Partial<Record<keyof CaseAgentRuntime, unknown>>;
++  return (
++    typeof runtime.spawn === 'function' &&
++    typeof runtime.createTools === 'function' &&
++    typeof runtime.abort === 'function'
++  );
++}
+-- 
+2.43.0
+
