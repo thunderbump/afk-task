@@ -134,7 +134,10 @@ child environment from the validated Codex auth file.
 The wrapper also writes a non-secret `ca` shim under
 `.automation-simple/case-bin/ca`, records it in `execution-request.json`, and
 prepends that directory to Case's child `PATH` so phase agents can call the same
-local Case checkout without a global `ca` install.
+local Case checkout without a global `ca` install. The shim preserves the
+agent's current working directory and invokes the Case entrypoint by absolute
+path, so relative task paths and repo-local `.case/active` markers resolve in
+the target repo.
 When `--case-runtime-module <path>` is passed, the command appends Case's native
 `--runtime-module <path>` flag and records the resolved path in
 `execution-request.json`. When `--case-dry-run` is passed, the command appends
@@ -195,8 +198,9 @@ the same interface and call Sandcastle from each Case phase.
 The local Case patches add `run --runtime-module <path>`, which dynamically
 imports a module exporting `createCaseRuntime()`, a default runtime factory, or
 a default runtime object. They also keep task status at `closing` when the close
-phase completes without a PR URL. Pi remains the default runtime when no module
-is supplied.
+phase completes without a PR URL, and preserve detailed `tested`/`reviewed`
+evidence marker files when event projections notice a completed verify or
+review phase. Pi remains the default runtime when no module is supplied.
 
 ## Sandcastle Findings
 

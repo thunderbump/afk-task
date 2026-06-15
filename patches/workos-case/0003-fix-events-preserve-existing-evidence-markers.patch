@@ -1,0 +1,125 @@
+From a63340a1fd11ed3fee743e915e4b7054fdc42d30 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sun, 14 Jun 2026 21:35:21 -0700
+Subject: [PATCH] fix(events): preserve existing evidence markers
+
+---
+ src/__tests__/events-appender.spec.ts | 74 +++++++++++++++++++++++++++
+ src/events/appender.ts                |  8 ++-
+ 2 files changed, 80 insertions(+), 2 deletions(-)
+
+diff --git a/src/__tests__/events-appender.spec.ts b/src/__tests__/events-appender.spec.ts
+index 7937628..7223f82 100644
+--- a/src/__tests__/events-appender.spec.ts
++++ b/src/__tests__/events-appender.spec.ts
+@@ -223,6 +223,40 @@ describe('EventAppender', () => {
+     expect(lastProjection.tested).toBe(true);
+   });
+
++  test('preserves existing tested marker evidence when verify phase completes', async () => {
++    const markerPath = resolve(tmpDir, '.case/task-1/tested');
++    const markerContent =
++      'timestamp: 2026-06-15T00:00:00.000Z\noutput_hash: abc123\npass_indicators: 2\nfail_indicators: 0\n';
++    await mkdir(resolve(markerPath, '..'), { recursive: true });
++    await writeFile(markerPath, markerContent);
++
++    const store = new MockTaskStore(taskJsonPath) as any;
++    const appender = new EventAppender(tmpDir, 'task-1', 'run-marker-preserve-tested', store);
++
++    await appender.append({ event: 'pipeline_start', taskId: 'task-1', profile: 'standard', plan: PLAN });
++    await appender.append({ event: 'phase_start', phase: 'implement', agent: 'implementer' });
++    await appender.append({
++      event: 'phase_end',
++      phase: 'implement',
++      agent: 'implementer',
++      outcome: 'completed',
++      durationMs: 100,
++    });
++    await appender.append({ event: 'phase_start', phase: 'verify', agent: 'verifier' });
++    await appender.append({
++      event: 'phase_end',
++      phase: 'verify',
++      agent: 'verifier',
++      outcome: 'completed',
++      durationMs: 100,
++    });
++
++    expect(await readFile(markerPath, 'utf-8')).toBe(markerContent);
++    expect(appender.getState().markers.has('tested')).toBe(true);
++    const lastProjection = writtenProjections[writtenProjections.length - 1];
++    expect(lastProjection.tested).toBe(true);
++  });
++
+   test('writes reviewed marker file on review phase_end completed', async () => {
+     const store = new MockTaskStore(taskJsonPath) as any;
+     const appender = new EventAppender(tmpDir, 'task-1', 'run-marker-2', store);
+@@ -258,6 +292,46 @@ describe('EventAppender', () => {
+     expect(appender.getState().markers.has('reviewed')).toBe(true);
+   });
+
++  test('preserves existing reviewed marker evidence when review phase completes', async () => {
++    const markerPath = resolve(tmpDir, '.case/task-1/reviewed');
++    const markerContent =
++      'timestamp: 2026-06-15T00:00:00.000Z\ncritical: 0\nwarnings: 1\ninfo: 2\n';
++    await mkdir(resolve(markerPath, '..'), { recursive: true });
++    await writeFile(markerPath, markerContent);
++
++    const store = new MockTaskStore(taskJsonPath) as any;
++    const appender = new EventAppender(tmpDir, 'task-1', 'run-marker-preserve-reviewed', store);
++
++    await appender.append({ event: 'pipeline_start', taskId: 'task-1', profile: 'standard', plan: PLAN });
++    await appender.append({ event: 'phase_start', phase: 'implement', agent: 'implementer' });
++    await appender.append({
++      event: 'phase_end',
++      phase: 'implement',
++      agent: 'implementer',
++      outcome: 'completed',
++      durationMs: 100,
++    });
++    await appender.append({ event: 'phase_start', phase: 'verify', agent: 'verifier' });
++    await appender.append({
++      event: 'phase_end',
++      phase: 'verify',
++      agent: 'verifier',
++      outcome: 'completed',
++      durationMs: 100,
++    });
++    await appender.append({ event: 'phase_start', phase: 'review', agent: 'reviewer' });
++    await appender.append({
++      event: 'phase_end',
++      phase: 'review',
++      agent: 'reviewer',
++      outcome: 'completed',
++      durationMs: 100,
++    });
++
++    expect(await readFile(markerPath, 'utf-8')).toBe(markerContent);
++    expect(appender.getState().markers.has('reviewed')).toBe(true);
++  });
++
+   test('restoreState allows resuming from existing state', async () => {
+     const store = new MockTaskStore(taskJsonPath) as any;
+     const appender = new EventAppender(tmpDir, 'task-1', 'run-8', store);
+diff --git a/src/events/appender.ts b/src/events/appender.ts
+index 6f37e36..297a0ba 100644
+--- a/src/events/appender.ts
++++ b/src/events/appender.ts
+@@ -1,4 +1,4 @@
+-import { appendFile, mkdir, writeFile } from 'node:fs/promises';
++import { access, appendFile, mkdir, writeFile } from 'node:fs/promises';
+ import { resolve } from 'node:path';
+ import type { TaskStore } from '../state/task-store.js';
+ import type { PipelineEvent, PipelineEventInput } from './schema.js';
+@@ -78,7 +78,11 @@ export class EventAppender {
+         const markerPath = resolve(this.caseRoot, marker.path);
+         const markerDir = resolve(markerPath, '..');
+         await mkdir(markerDir, { recursive: true });
+-        await writeFile(markerPath, new Date().toISOString());
++        try {
++          await access(markerPath);
++        } catch {
++          await writeFile(markerPath, new Date().toISOString());
++        }
+         this.state.markers.add(marker.name);
+       }
+     }

@@ -556,8 +556,7 @@ def write_case_cli_shim(*, state_dir: Path, case_checkout: Path) -> Path:
                 "#!/usr/bin/env sh",
                 "set -eu",
                 f"CASE_CHECKOUT={shlex.quote(str(case_checkout))}",
-                'cd "$CASE_CHECKOUT"',
-                'exec bun src/index.ts "$@"',
+                'exec bun "$CASE_CHECKOUT/src/index.ts" "$@"',
                 "",
             ]
         ),

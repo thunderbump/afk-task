@@ -266,7 +266,7 @@ class RunBeadCliTest(unittest.TestCase):
             shim_text = case_cli_shim.read_text(encoding="utf-8")
             self.assertIn("CASE_CHECKOUT=", shim_text)
             self.assertIn(str(case_checkout), shim_text)
-            self.assertIn('exec bun src/index.ts "$@"', shim_text)
+            self.assertIn('exec bun "$CASE_CHECKOUT/src/index.ts" "$@"', shim_text)
             self.assertIsNone(fake_case_record["beads_password"])
             self.assertIsNone(fake_case_record["openai_api_key"])
             self.assertIsNone(fake_case_record["pi_coding_agent_dir"])
@@ -282,6 +282,86 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertEqual(execution_request["case_cli_shim"], str(case_cli_shim))
             self.assertNotIn("ambient-openai-key", json.dumps(execution_request))
             self.assertNotIn("must-not-reach-case", json.dumps(execution_request))
+
+    def test_case_cli_shim_preserves_agent_cwd_and_uses_absolute_case_entrypoint(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            target_repo.mkdir()
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            fake_bun = fake_bin / "bun"
+            fake_bun.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "Path(os.environ['FAKE_BUN_RECORD']).write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "  'cwd': os.getcwd(),",
+                        "}) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_bun.chmod(0o755)
+            record_path = tmp_path / "bun-record.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.9")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.9",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                "true",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            shim_result = subprocess.run(
+                [
+                    str(case_cli_shim),
+                    "status",
+                    ".case/tasks/active/central-run.9.task.json",
+                ],
+                cwd=target_repo,
+                env={
+                    **os.environ,
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "FAKE_BUN_RECORD": str(record_path),
+                },
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(
+                shim_result.returncode, 0, shim_result.stdout + shim_result.stderr
+            )
+            bun_record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(bun_record["cwd"], str(target_repo))
+            self.assertEqual(
+                bun_record["argv"],
+                [
+                    str(case_checkout / "src" / "index.ts"),
+                    "status",
+                    ".case/tasks/active/central-run.9.task.json",
+                ],
+            )
 
     def test_case_codex_session_writes_wrapper_config_and_injects_child_env_only(
         self,
