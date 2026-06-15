@@ -34,24 +34,29 @@ This repo should be push-ready for `git@github.com:thunderbump/afk-task.git`
 without raw upstream checkouts, Sandcastle sources, `node_modules`, or local run
 state.
 
-Prepare the external Case checkout outside this repo:
+Prepare the external Case checkout with the setup script:
 
 ```sh
-git clone https://github.com/workos/case.git ../workos-case
-(cd ../workos-case && bun install)
-(cd ../workos-case && git config user.email "agent@example.invalid")
-(cd ../workos-case && git config user.name "Automation Workflow")
-scripts/apply-case-patches.sh --case-checkout ../workos-case
-(cd ../workos-case && bun run generate:assets)
+scripts/setup-case-checkout.sh
+export CASE_CHECKOUT="$(pwd)/.external/workos-case"
+```
+
+By default, the script clones `https://github.com/workos/case.git` into
+`.external/workos-case`, which is ignored by Git. It installs Case dependencies,
+sets local-only Git identity for patch application if needed, applies
+`patches/workos-case/*.patch` idempotently, and refreshes Case's generated
+package asset list.
+
+To keep Case somewhere else, pass the checkout path explicitly:
+
+```sh
+scripts/setup-case-checkout.sh --case-checkout ../workos-case
 export CASE_CHECKOUT="$(cd ../workos-case && pwd)"
 ```
 
-The patch script also accepts `CASE_CHECKOUT=/path/to/workos-case`. There is no
-machine-local default path; every fresh clone must set `CASE_CHECKOUT` or pass
-`--case-checkout /path/to/workos-case` to the runner. The `git config` commands
-are local to the Case checkout and let `git am` apply the patch series on a
-machine that has no global Git identity configured. `bun run generate:assets`
-refreshes Case's generated package asset list after the patches are applied.
+The runner itself still requires `CASE_CHECKOUT` or `--case-checkout` so it does
+not depend on one machine's local directory layout. The setup script is only the
+repeatable way to create and refresh that external checkout.
 
 For Sandcastle work, keep dependencies in the external Case checkout or in a
 separate adapter package. The scaffold at

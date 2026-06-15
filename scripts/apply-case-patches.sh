@@ -3,10 +3,11 @@ set -eu
 
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 case_checkout="${CASE_CHECKOUT:-}"
+patch_dir="$repo_root/patches/workos-case"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/apply-case-patches.sh --case-checkout /path/to/workos-case
+Usage: scripts/apply-case-patches.sh --case-checkout /path/to/workos-case [--patch-dir /path/to/patches]
 
 Applies patches/workos-case/*.patch to an external workos/case checkout.
 The checkout can also be supplied with CASE_CHECKOUT=/path/to/workos-case.
@@ -21,6 +22,14 @@ while [ "$#" -gt 0 ]; do
         exit 2
       fi
       case_checkout="$2"
+      shift 2
+      ;;
+    --patch-dir)
+      if [ "$#" -lt 2 ]; then
+        echo "error: --patch-dir requires a path" >&2
+        exit 2
+      fi
+      patch_dir="$2"
       shift 2
       ;;
     -h|--help)
@@ -45,4 +54,21 @@ if ! git -C "$case_checkout" rev-parse --show-toplevel >/dev/null 2>&1; then
   exit 2
 fi
 
-git -C "$case_checkout" am "$repo_root"/patches/workos-case/*.patch
+if [ ! -d "$patch_dir" ]; then
+  echo "error: patch directory does not exist: $patch_dir" >&2
+  exit 2
+fi
+
+set -- "$patch_dir"/*.patch
+if [ ! -e "$1" ]; then
+  echo "error: no patch files found in: $patch_dir" >&2
+  exit 2
+fi
+
+for patch in "$@"; do
+  if git -C "$case_checkout" apply --reverse --check "$patch" >/dev/null 2>&1; then
+    echo "already applied: $(basename -- "$patch")"
+  else
+    git -C "$case_checkout" am "$patch"
+  fi
+done
