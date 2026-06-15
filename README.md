@@ -131,6 +131,10 @@ Ambient `OPENAI_API_KEY` and `PI_CODING_AGENT_DIR` are also removed unless
 `--case-codex-session` is enabled. In wrapper mode, `PI_CODING_AGENT_DIR` points
 to `.automation-simple/pi-codex` and `OPENAI_API_KEY` is populated only in the
 child environment from the validated Codex auth file.
+The wrapper also writes a non-secret `ca` shim under
+`.automation-simple/case-bin/ca`, records it in `execution-request.json`, and
+prepends that directory to Case's child `PATH` so phase agents can call the same
+local Case checkout without a global `ca` install.
 When `--case-runtime-module <path>` is passed, the command appends Case's native
 `--runtime-module <path>` flag and records the resolved path in
 `execution-request.json`. When `--case-dry-run` is passed, the command appends

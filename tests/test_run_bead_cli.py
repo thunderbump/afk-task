@@ -140,13 +140,15 @@ class RunBeadCliTest(unittest.TestCase):
                 "\n".join(
                     [
                         "#!/usr/bin/env python3",
-                        "import json, os, sys",
+                        "import json, os, shutil, sys",
                         "from pathlib import Path",
                         "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
                         "  'argv': sys.argv[1:],",
                         "  'cwd': os.getcwd(),",
                         "  'case_data_dir': os.environ.get('CASE_DATA_DIR'),",
                         "  'home': os.environ.get('HOME'),",
+                        "  'path': os.environ.get('PATH'),",
+                        "  'ca_path': shutil.which('ca'),",
                         "  'beads_password': os.environ.get('BEADS_DOLT_PASSWORD'),",
                         "  'openai_api_key': os.environ.get('OPENAI_API_KEY'),",
                         "  'pi_coding_agent_dir': os.environ.get('PI_CODING_AGENT_DIR'),",
@@ -217,6 +219,14 @@ class RunBeadCliTest(unittest.TestCase):
                 task_json["checkCommand"], "python3 -m unittest discover -s tests"
             )
             self.assertIn("Generate Case state and hand off.", task_md_path.read_text())
+            task_markdown = task_md_path.read_text(encoding="utf-8")
+            self.assertIn("## Evidence Expectations", task_markdown)
+            self.assertIn(
+                "Run `python3 -m unittest discover -s tests`", task_markdown
+            )
+            self.assertIn("test-output evidence", task_markdown)
+            self.assertIn("changed paths", task_markdown)
+            self.assertIn("No screenshot or video evidence is required", task_markdown)
 
             project_manifest = json.loads(
                 (state_dir / "case-data" / "projects.json").read_text(encoding="utf-8")
@@ -246,6 +256,17 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertEqual(
                 fake_case_record["case_data_dir"], str(state_dir / "case-data")
             )
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            self.assertEqual(fake_case_record["ca_path"], str(case_cli_shim))
+            self.assertEqual(
+                fake_case_record["path"].split(os.pathsep)[0],
+                str(case_cli_shim.parent),
+            )
+            self.assertTrue(os.access(case_cli_shim, os.X_OK))
+            shim_text = case_cli_shim.read_text(encoding="utf-8")
+            self.assertIn("CASE_CHECKOUT=", shim_text)
+            self.assertIn(str(case_checkout), shim_text)
+            self.assertIn('exec bun src/index.ts "$@"', shim_text)
             self.assertIsNone(fake_case_record["beads_password"])
             self.assertIsNone(fake_case_record["openai_api_key"])
             self.assertIsNone(fake_case_record["pi_coding_agent_dir"])
@@ -258,6 +279,9 @@ class RunBeadCliTest(unittest.TestCase):
                 execution_request["sandcastle_runtime_adapter"]["status"],
                 "scaffolded",
             )
+            self.assertEqual(execution_request["case_cli_shim"], str(case_cli_shim))
+            self.assertNotIn("ambient-openai-key", json.dumps(execution_request))
+            self.assertNotIn("must-not-reach-case", json.dumps(execution_request))
 
     def test_case_codex_session_writes_wrapper_config_and_injects_child_env_only(
         self,

@@ -5,6 +5,7 @@ import base64
 import binascii
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -160,6 +161,10 @@ def run_bead(
     )
     if codex_session is not None:
         write_pi_codex_models_config(codex_session)
+    case_cli_shim = write_case_cli_shim(
+        state_dir=state_dir,
+        case_checkout=case_checkout,
+    )
     request_path = write_execution_request(
         state_dir=state_dir,
         issue=issue,
@@ -167,6 +172,7 @@ def run_bead(
         task_json=task_json,
         case_checkout=case_checkout,
         case_data_dir=case_data,
+        case_cli_shim=case_cli_shim,
         review_branch=review_branch,
         case_dry_run=case_dry_run,
         case_runtime_module=case_runtime_module,
@@ -177,6 +183,7 @@ def run_bead(
         case_command=case_command,
         case_checkout=case_checkout,
         case_data_dir=case_data,
+        case_cli_shim=case_cli_shim,
         task_json=task_json,
         case_dry_run=case_dry_run,
         case_runtime_module=case_runtime_module,
@@ -422,6 +429,22 @@ def write_case_task(
                 str(issue.get("description") or "").strip()
                 or "(No description provided.)",
                 "",
+                "## Evidence Expectations",
+                "",
+                (
+                    "Use test-output evidence for this task. Run "
+                    f"`{metadata['validation_command']}` and include the command "
+                    "output or a concise result summary in verifier evidence."
+                ),
+                (
+                    "Confirm the validation covers the changed paths, or note any "
+                    "changed paths that were not covered by the command."
+                ),
+                (
+                    "No screenshot or video evidence is required unless the bead "
+                    "description or implementation task explicitly asks for UI evidence."
+                ),
+                "",
             ]
         ),
         encoding="utf-8",
@@ -523,6 +546,27 @@ def write_case_projects_manifest(
     return projects_path
 
 
+def write_case_cli_shim(*, state_dir: Path, case_checkout: Path) -> Path:
+    shim_dir = state_dir / "case-bin"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    shim_path = shim_dir / "ca"
+    shim_path.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env sh",
+                "set -eu",
+                f"CASE_CHECKOUT={shlex.quote(str(case_checkout))}",
+                'cd "$CASE_CHECKOUT"',
+                'exec bun src/index.ts "$@"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    shim_path.chmod(0o755)
+    return shim_path
+
+
 def write_pi_codex_models_config(codex_session: CaseCodexSession) -> Path:
     codex_session.pi_config_dir.mkdir(parents=True, exist_ok=True)
     models_path = codex_session.pi_config_dir / "models.json"
@@ -571,6 +615,7 @@ def write_execution_request(
     task_json: Path,
     case_checkout: Path,
     case_data_dir: Path,
+    case_cli_shim: Path,
     review_branch: str,
     case_dry_run: bool,
     case_runtime_module: Path | None,
@@ -585,6 +630,7 @@ def write_execution_request(
             {
                 "bead_id": issue["id"],
                 "case_checkout": str(case_checkout),
+                "case_cli_shim": str(case_cli_shim),
                 "case_data_dir": str(case_data_dir),
                 "case_dry_run": case_dry_run,
                 "case_runtime_module": (
@@ -635,6 +681,7 @@ def run_case_command(
     case_command: str,
     case_checkout: Path,
     case_data_dir: Path,
+    case_cli_shim: Path,
     task_json: Path,
     case_dry_run: bool,
     case_runtime_module: Path | None,
@@ -652,6 +699,12 @@ def run_case_command(
     env["CASE_DATA_DIR"] = str(case_data_dir)
     env["XDG_CONFIG_HOME"] = str(case_data_dir / "config-home")
     env["HOME"] = str(case_data_dir / "home")
+    inherited_path = env.get("PATH")
+    env["PATH"] = (
+        f"{case_cli_shim.parent}{os.pathsep}{inherited_path}"
+        if inherited_path
+        else str(case_cli_shim.parent)
+    )
     if codex_session is not None:
         env["OPENAI_API_KEY"] = codex_session.access_token
         env["PI_CODING_AGENT_DIR"] = str(codex_session.pi_config_dir)
