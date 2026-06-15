@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from base64 import urlsafe_b64encode
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -28,6 +30,56 @@ def run_cli(
 
 
 class RunBeadCliTest(unittest.TestCase):
+    def write_eligible_bead(self, path: Path, target_repo: Path, bead_id: str) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "id": bead_id,
+                    "title": "Wire simple runner",
+                    "description": "Generate Case state and hand off.",
+                    "status": "open",
+                    "labels": ["project:automation", "ready-for-agent"],
+                    "metadata": {
+                        "afk_enabled": True,
+                        "afk_runner": "codex",
+                        "target_repo": "local/test",
+                        "target_repo_path": str(target_repo),
+                        "target_base_branch": "main",
+                        "branch_policy": "independent",
+                        "validation_command": "python3 -m unittest discover -s tests",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def fake_jwt(self, payload: dict[str, object]) -> str:
+        def encode(part: dict[str, object] | bytes) -> str:
+            raw = (
+                json.dumps(part, separators=(",", ":")).encode("utf-8")
+                if isinstance(part, dict)
+                else part
+            )
+            return urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+        return ".".join([encode({"alg": "none", "typ": "JWT"}), encode(payload), "sig"])
+
+    def write_codex_auth(self, path: Path, payload: dict[str, object]) -> str:
+        token = self.fake_jwt(payload)
+        path.write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": token,
+                        "refresh_token": "fixture-refresh-token",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return token
+
     def test_ineligible_bead_stops_before_case_state_or_execution(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -96,6 +148,8 @@ class RunBeadCliTest(unittest.TestCase):
                         "  'case_data_dir': os.environ.get('CASE_DATA_DIR'),",
                         "  'home': os.environ.get('HOME'),",
                         "  'beads_password': os.environ.get('BEADS_DOLT_PASSWORD'),",
+                        "  'openai_api_key': os.environ.get('OPENAI_API_KEY'),",
+                        "  'pi_coding_agent_dir': os.environ.get('PI_CODING_AGENT_DIR'),",
                         "}) + '\\n', encoding='utf-8')",
                     ]
                 ),
@@ -137,7 +191,11 @@ class RunBeadCliTest(unittest.TestCase):
                 str(case_checkout),
                 "--case-command",
                 str(fake_case),
-                env={"BEADS_DOLT_PASSWORD": "must-not-reach-case"},
+                env={
+                    "BEADS_DOLT_PASSWORD": "must-not-reach-case",
+                    "OPENAI_API_KEY": "ambient-openai-key",
+                    "PI_CODING_AGENT_DIR": "ambient-pi-dir",
+                },
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -189,6 +247,8 @@ class RunBeadCliTest(unittest.TestCase):
                 fake_case_record["case_data_dir"], str(state_dir / "case-data")
             )
             self.assertIsNone(fake_case_record["beads_password"])
+            self.assertIsNone(fake_case_record["openai_api_key"])
+            self.assertIsNone(fake_case_record["pi_coding_agent_dir"])
 
             requests = list((state_dir / "runs").glob("*/execution-request.json"))
             self.assertEqual(len(requests), 1)
@@ -198,6 +258,222 @@ class RunBeadCliTest(unittest.TestCase):
                 execution_request["sandcastle_runtime_adapter"]["status"],
                 "scaffolded",
             )
+
+    def test_case_codex_session_writes_wrapper_config_and_injects_child_env_only(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            target_repo.mkdir()
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            auth_file = tmp_path / "auth.json"
+            token = self.write_codex_auth(
+                auth_file,
+                {
+                    "exp": int(time.time()) + 3600,
+                    "https://api.openai.com/auth.chatgpt_account_id": "acct_fixture",
+                },
+            )
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "  'pi_coding_agent_dir': os.environ.get('PI_CODING_AGENT_DIR'),",
+                        "  'openai_api_key': os.environ.get('OPENAI_API_KEY'),",
+                        "  'beads_password': os.environ.get('BEADS_DOLT_PASSWORD'),",
+                        "}) + '\\n', encoding='utf-8')",
+                        "print(os.environ.get('OPENAI_API_KEY'))",
+                        "print(os.environ.get('OPENAI_API_KEY'), file=sys.stderr)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.8")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.8",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--case-codex-session",
+                "--codex-auth-file",
+                str(auth_file),
+                "--case-codex-scout-only",
+                env={"BEADS_DOLT_PASSWORD": "must-not-reach-case"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            fake_case_record = json.loads(
+                fake_case.with_suffix(".json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(fake_case_record["openai_api_key"], token)
+            self.assertEqual(
+                fake_case_record["pi_coding_agent_dir"],
+                str(state_dir / "pi-codex"),
+            )
+            self.assertIsNone(fake_case_record["beads_password"])
+
+            pi_models = json.loads(
+                (state_dir / "pi-codex" / "models.json").read_text(encoding="utf-8")
+            )
+            openai_model = pi_models["providers"]["openai"]["models"][0]
+            self.assertEqual(openai_model["id"], "gpt-5.5")
+            self.assertEqual(openai_model["api"], "openai-codex-responses")
+            self.assertEqual(openai_model["baseUrl"], "https://chatgpt.com/backend-api")
+            self.assertNotIn(token, json.dumps(pi_models))
+
+            case_config = json.loads(
+                (state_dir / "case-data" / "config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                case_config["models"]["scout"],
+                {"provider": "openai", "model": "gpt-5.5"},
+            )
+            self.assertEqual(
+                case_config["models"]["default"],
+                {"provider": "invalid", "model": "invalid-scout-only"},
+            )
+
+            execution_request = json.loads(
+                next((state_dir / "runs").glob("*/execution-request.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                execution_request["case_codex_session"],
+                {
+                    "enabled": True,
+                    "auth_source_path": str(auth_file),
+                    "model": "gpt-5.5",
+                    "pi_config_dir": str(state_dir / "pi-codex"),
+                    "scout_only": True,
+                },
+            )
+            self.assertNotIn(token, json.dumps(execution_request))
+            run_dir = next((state_dir / "runs").glob("*"))
+            self.assertNotIn(
+                token, (run_dir / "case-stdout.txt").read_text(encoding="utf-8")
+            )
+            self.assertNotIn(
+                token, (run_dir / "case-stderr.txt").read_text(encoding="utf-8")
+            )
+            self.assertNotIn(token, result.stdout + result.stderr)
+
+    def test_case_codex_session_auth_failures_stop_before_case(self) -> None:
+        cases: list[tuple[str, str | None, str]] = [
+            (
+                "missing-file",
+                None,
+                "missing Codex auth file",
+            ),
+            (
+                "expired-token",
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "access_token": self.fake_jwt(
+                                {
+                                    "exp": int(time.time()) - 60,
+                                    "https://api.openai.com/auth.chatgpt_account_id": (
+                                        "acct_fixture"
+                                    ),
+                                }
+                            )
+                        },
+                    }
+                ),
+                "expired or too close to expiry",
+            ),
+            (
+                "malformed-token",
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {"access_token": "not-a-jwt"},
+                    }
+                ),
+                "not a JWT",
+            ),
+            (
+                "missing-chatgpt-claim",
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "access_token": self.fake_jwt(
+                                {"exp": int(time.time()) + 3600}
+                            )
+                        },
+                    }
+                ),
+                "missing ChatGPT account claim",
+            ),
+        ]
+        for name, auth_json, expected_error in cases:
+            with self.subTest(name=name), TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                target_repo = tmp_path / "target"
+                target_repo.mkdir()
+                state_dir = tmp_path / ".automation-simple"
+                case_checkout = tmp_path / "workos-case"
+                case_checkout.mkdir()
+                fake_case = tmp_path / "fake-case"
+                fake_case.write_text(
+                    "\n".join(
+                        [
+                            "#!/usr/bin/env python3",
+                            "from pathlib import Path",
+                            "Path(__file__).with_suffix('.json').write_text('ran\\n', encoding='utf-8')",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                fake_case.chmod(0o755)
+                bead_json = tmp_path / "bead.json"
+                self.write_eligible_bead(bead_json, target_repo, f"central-{name}")
+                auth_file = tmp_path / "auth.json"
+                if auth_json is not None:
+                    auth_file.write_text(auth_json, encoding="utf-8")
+
+                result = run_cli(
+                    "run",
+                    "--bead",
+                    f"central-{name}",
+                    "--bead-json",
+                    str(bead_json),
+                    "--state-dir",
+                    str(state_dir),
+                    "--case-checkout",
+                    str(case_checkout),
+                    "--case-command",
+                    str(fake_case),
+                    "--case-codex-session",
+                    "--codex-auth-file",
+                    str(auth_file),
+                )
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(fake_case.with_suffix(".json").exists())
+                self.assertFalse((state_dir / "case-data").exists())
 
     def test_case_dry_run_flag_is_passed_to_case_command(self) -> None:
         with TemporaryDirectory() as tmp:

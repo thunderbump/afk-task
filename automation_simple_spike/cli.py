@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,6 +23,18 @@ REQUIRED_METADATA = [
     "branch_policy",
     "validation_command",
 ]
+
+CODEX_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
+CODEX_TOKEN_EXPIRY_MARGIN_SECONDS = 300
+
+
+@dataclass(frozen=True)
+class CaseCodexSession:
+    access_token: str
+    auth_source_path: Path
+    model: str
+    pi_config_dir: Path
+    scout_only: bool
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,6 +53,13 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--case-command", default="bun")
     run.add_argument("--case-dry-run", action="store_true")
     run.add_argument("--case-runtime-module")
+    run.add_argument("--case-codex-session", action="store_true")
+    run.add_argument(
+        "--codex-auth-file",
+        default=str(Path.home() / ".codex" / "auth.json"),
+    )
+    run.add_argument("--codex-model", default="gpt-5.5")
+    run.add_argument("--case-codex-scout-only", action="store_true")
     run.add_argument("--bd-command", default="bd")
     run.add_argument("--beads-workspace", default="/home/bump/Projects/beads")
     run.add_argument(
@@ -57,6 +80,10 @@ def main(argv: list[str] | None = None) -> int:
             case_runtime_module=(
                 Path(args.case_runtime_module) if args.case_runtime_module else None
             ),
+            case_codex_session=args.case_codex_session,
+            codex_auth_file=Path(args.codex_auth_file),
+            codex_model=args.codex_model,
+            case_codex_scout_only=args.case_codex_scout_only,
             bd_command=args.bd_command,
             beads_workspace=Path(args.beads_workspace),
             beads_password_file=Path(args.beads_password_file),
@@ -75,6 +102,10 @@ def run_bead(
     case_command: str,
     case_dry_run: bool,
     case_runtime_module: Path | None,
+    case_codex_session: bool,
+    codex_auth_file: Path,
+    codex_model: str,
+    case_codex_scout_only: bool,
     bd_command: str,
     beads_workspace: Path,
     beads_password_file: Path,
@@ -85,6 +116,7 @@ def run_bead(
         case_data_dir = case_data_dir.resolve()
     if case_runtime_module is not None:
         case_runtime_module = case_runtime_module.resolve()
+    codex_auth_file = codex_auth_file.resolve()
     issue = load_issue(
         bead_id=bead_id,
         bead_json=bead_json,
@@ -96,6 +128,19 @@ def run_bead(
     if reasons:
         print(f"run-bead ineligible: {bead_id}: {'; '.join(reasons)}", file=sys.stderr)
         return 1
+
+    codex_session = None
+    if case_codex_session:
+        try:
+            codex_session = load_case_codex_session(
+                auth_file=codex_auth_file,
+                model=codex_model,
+                pi_config_dir=state_dir / "pi-codex",
+                scout_only=case_codex_scout_only,
+            )
+        except ValueError as error:
+            print(f"run-bead codex session invalid: {error}", file=sys.stderr)
+            return 1
 
     metadata = issue["metadata"]
     target_repo = Path(str(metadata["target_repo_path"])).resolve()
@@ -111,7 +156,10 @@ def run_bead(
         repo_name=str(metadata["target_repo"]),
         repo_path=target_repo,
         validation_command=str(metadata["validation_command"]),
+        codex_session=codex_session,
     )
+    if codex_session is not None:
+        write_pi_codex_models_config(codex_session)
     request_path = write_execution_request(
         state_dir=state_dir,
         issue=issue,
@@ -122,6 +170,7 @@ def run_bead(
         review_branch=review_branch,
         case_dry_run=case_dry_run,
         case_runtime_module=case_runtime_module,
+        codex_session=codex_session,
     )
     generated_task_json = task_json.read_text(encoding="utf-8") if case_dry_run else None
     result = run_case_command(
@@ -131,6 +180,7 @@ def run_bead(
         task_json=task_json,
         case_dry_run=case_dry_run,
         case_runtime_module=case_runtime_module,
+        codex_session=codex_session,
     )
     if case_dry_run and generated_task_json is not None:
         preserve_native_dry_run_task(
@@ -139,7 +189,12 @@ def run_bead(
             generated_task_json=generated_task_json,
         )
     interpreted_returncode = interpreted_case_returncode(result)
-    write_case_command_result(request_path.parent, result, interpreted_returncode)
+    write_case_command_result(
+        request_path.parent,
+        result,
+        interpreted_returncode,
+        redactions=([codex_session.access_token] if codex_session is not None else None),
+    )
     if interpreted_returncode != 0:
         if result.returncode == 0:
             print("run-bead failed: Case pipeline reported failure", file=sys.stderr)
@@ -200,6 +255,86 @@ def beads_subprocess_env(password_file: Path) -> dict[str, str]:
     if password:
         env["BEADS_DOLT_PASSWORD"] = password
     return env
+
+
+def load_case_codex_session(
+    *,
+    auth_file: Path,
+    model: str,
+    pi_config_dir: Path,
+    scout_only: bool,
+) -> CaseCodexSession:
+    try:
+        raw_auth = auth_file.read_text(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise ValueError(
+            f"missing Codex auth file at {auth_file}; run Codex login first"
+        ) from error
+
+    try:
+        auth = json.loads(raw_auth)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Codex auth file at {auth_file} is not valid JSON") from error
+
+    if not isinstance(auth, dict):
+        raise ValueError("Codex auth file must contain a JSON object")
+    if auth.get("auth_mode") != "chatgpt":
+        raise ValueError("Codex auth_mode must be chatgpt")
+
+    tokens = auth.get("tokens")
+    if not isinstance(tokens, dict):
+        raise ValueError("Codex auth file is missing tokens")
+    access_token = tokens.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise ValueError("Codex auth file is missing tokens.access_token")
+
+    payload = decode_jwt_payload(access_token)
+    exp = payload.get("exp")
+    if not isinstance(exp, (int, float)):
+        raise ValueError("Codex access token is missing exp")
+    if exp <= time.time() + CODEX_TOKEN_EXPIRY_MARGIN_SECONDS:
+        raise ValueError("Codex access token is expired or too close to expiry")
+    if not has_chatgpt_account_claim(payload):
+        raise ValueError("Codex access token is missing ChatGPT account claim")
+
+    return CaseCodexSession(
+        access_token=access_token,
+        auth_source_path=auth_file,
+        model=model,
+        pi_config_dir=pi_config_dir,
+        scout_only=scout_only,
+    )
+
+
+def decode_jwt_payload(token: str) -> dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("Codex access token is not a JWT")
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode((payload + padding).encode("ascii"))
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Codex access token has a malformed JWT payload") from error
+    if not isinstance(parsed, dict):
+        raise ValueError("Codex access token JWT payload must be an object")
+    return parsed
+
+
+def has_chatgpt_account_claim(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if (
+                key == "https://api.openai.com/auth.chatgpt_account_id"
+                or key == "chatgpt_account_id"
+            ) and isinstance(nested, str) and nested:
+                return True
+            if has_chatgpt_account_claim(nested):
+                return True
+    elif isinstance(value, list):
+        return any(has_chatgpt_account_claim(item) for item in value)
+    return False
 
 
 def eligibility_rejections(issue: dict[str, Any]) -> list[str]:
@@ -328,6 +463,7 @@ def write_case_projects_manifest(
     repo_name: str,
     repo_path: Path,
     validation_command: str,
+    codex_session: CaseCodexSession | None = None,
 ) -> Path:
     case_data_dir.mkdir(parents=True, exist_ok=True)
     (case_data_dir / "home").mkdir(parents=True, exist_ok=True)
@@ -370,11 +506,61 @@ def write_case_projects_manifest(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    case_config: dict[str, Any] = {"projects": "./projects.json"}
+    if codex_session is not None:
+        model_config = {"provider": "openai", "model": codex_session.model}
+        if codex_session.scout_only:
+            case_config["models"] = {
+                "default": {"provider": "invalid", "model": "invalid-scout-only"},
+                "scout": model_config,
+            }
+        else:
+            case_config["models"] = {"default": model_config}
     (case_data_dir / "config.json").write_text(
-        json.dumps({"projects": "./projects.json"}, indent=2, sort_keys=True) + "\n",
+        json.dumps(case_config, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return projects_path
+
+
+def write_pi_codex_models_config(codex_session: CaseCodexSession) -> Path:
+    codex_session.pi_config_dir.mkdir(parents=True, exist_ok=True)
+    models_path = codex_session.pi_config_dir / "models.json"
+    models_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openai": {
+                        "models": [
+                            {
+                                "api": "openai-codex-responses",
+                                "baseUrl": CODEX_CHATGPT_BASE_URL,
+                                "contextWindow": 272000,
+                                "cost": {
+                                    "cacheRead": 0,
+                                    "cacheWrite": 0,
+                                    "input": 0,
+                                    "output": 0,
+                                },
+                                "id": codex_session.model,
+                                "input": ["text", "image"],
+                                "maxTokens": 100000,
+                                "name": (
+                                    f"{codex_session.model} via ChatGPT Codex"
+                                ),
+                                "reasoning": True,
+                            }
+                        ]
+                    }
+                }
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return models_path
 
 
 def write_execution_request(
@@ -388,6 +574,7 @@ def write_execution_request(
     review_branch: str,
     case_dry_run: bool,
     case_runtime_module: Path | None,
+    codex_session: CaseCodexSession | None = None,
 ) -> Path:
     metadata = issue["metadata"]
     run_dir = state_dir / "runs" / make_run_id(str(issue["id"]))
@@ -403,6 +590,7 @@ def write_execution_request(
                 "case_runtime_module": (
                     str(case_runtime_module) if case_runtime_module is not None else None
                 ),
+                "case_codex_session": case_codex_session_metadata(codex_session),
                 "case_task_json": str(task_json),
                 "case_task_markdown": str(task_md),
                 "target_repo": metadata["target_repo"],
@@ -428,6 +616,20 @@ def write_execution_request(
     return request_path
 
 
+def case_codex_session_metadata(
+    codex_session: CaseCodexSession | None,
+) -> dict[str, Any]:
+    if codex_session is None:
+        return {"enabled": False}
+    return {
+        "auth_source_path": str(codex_session.auth_source_path),
+        "enabled": True,
+        "model": codex_session.model,
+        "pi_config_dir": str(codex_session.pi_config_dir),
+        "scout_only": codex_session.scout_only,
+    }
+
+
 def run_case_command(
     *,
     case_command: str,
@@ -436,13 +638,23 @@ def run_case_command(
     task_json: Path,
     case_dry_run: bool,
     case_runtime_module: Path | None,
+    codex_session: CaseCodexSession | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    for key in ("BEADS_DIR", "BEADS_DOLT_PASSWORD", "AUTOMATION_BEADS_WORKSPACE"):
+    for key in (
+        "BEADS_DIR",
+        "BEADS_DOLT_PASSWORD",
+        "AUTOMATION_BEADS_WORKSPACE",
+        "OPENAI_API_KEY",
+        "PI_CODING_AGENT_DIR",
+    ):
         env.pop(key, None)
     env["CASE_DATA_DIR"] = str(case_data_dir)
     env["XDG_CONFIG_HOME"] = str(case_data_dir / "config-home")
     env["HOME"] = str(case_data_dir / "home")
+    if codex_session is not None:
+        env["OPENAI_API_KEY"] = codex_session.access_token
+        env["PI_CODING_AGENT_DIR"] = str(codex_session.pi_config_dir)
     command = [
         case_command,
         "src/index.ts",
@@ -471,10 +683,17 @@ def write_case_command_result(
     run_dir: Path,
     result: subprocess.CompletedProcess[str],
     interpreted_returncode: int | None = None,
+    redactions: list[str] | None = None,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "case-stdout.txt").write_text(result.stdout, encoding="utf-8")
-    (run_dir / "case-stderr.txt").write_text(result.stderr, encoding="utf-8")
+    (run_dir / "case-stdout.txt").write_text(
+        redact_text(result.stdout, redactions),
+        encoding="utf-8",
+    )
+    (run_dir / "case-stderr.txt").write_text(
+        redact_text(result.stderr, redactions),
+        encoding="utf-8",
+    )
     (run_dir / "case-result.json").write_text(
         json.dumps(
             {
@@ -491,6 +710,16 @@ def write_case_command_result(
         + "\n",
         encoding="utf-8",
     )
+
+
+def redact_text(text: str, redactions: list[str] | None) -> str:
+    if not redactions:
+        return text
+    redacted = text
+    for secret in redactions:
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
 
 
 def preserve_native_dry_run_task(

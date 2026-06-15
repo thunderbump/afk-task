@@ -29,6 +29,40 @@ To pass a Case runtime adapter module through to native Case, pass:
 python3 -m automation_simple_spike run --bead <bead-id> --case-runtime-module <path>
 ```
 
+To prepare native Case's default Pi transport to use a local Codex ChatGPT
+session token, pass:
+
+```sh
+python3 -m automation_simple_spike run \
+  --bead <bead-id> \
+  --case-codex-session
+```
+
+By default this reads `~/.codex/auth.json` at runtime, validates that it is a
+non-expired ChatGPT Codex session token, writes a non-secret Pi model alias under
+`.automation-simple/pi-codex/models.json`, writes Case model selection under
+`.automation-simple/case-data/config.json`, and passes the access token only to
+the child Case process as `OPENAI_API_KEY`. The auth file is not copied, and no
+token value is written by this wrapper.
+
+Useful wrapper options:
+
+```sh
+python3 -m automation_simple_spike run \
+  --bead <bead-id> \
+  --case-codex-session \
+  --codex-auth-file /path/to/auth.json \
+  --codex-model gpt-5.5 \
+  --case-codex-scout-only
+```
+
+`--case-codex-scout-only` is a bounded proof mode: it configures Case's `scout`
+model as `openai/<model>` and intentionally sets the default model to an invalid
+sentinel so later phases cannot silently run. Live runs with
+`--case-codex-session` are human-gated because they use local ChatGPT/Codex
+session credentials and may call the model. The test suite covers this path only
+with fake auth fixtures and fake Case commands.
+
 This repo includes one local proof module:
 
 ```sh
@@ -93,6 +127,10 @@ bun src/index.ts run --task <task-json> --mode unattended
 
 with `CASE_DATA_DIR`, `XDG_CONFIG_HOME`, and `HOME` pointed at the spike-owned
 Case data dir. Beads environment variables are removed before invoking Case.
+Ambient `OPENAI_API_KEY` and `PI_CODING_AGENT_DIR` are also removed unless
+`--case-codex-session` is enabled. In wrapper mode, `PI_CODING_AGENT_DIR` points
+to `.automation-simple/pi-codex` and `OPENAI_API_KEY` is populated only in the
+child environment from the validated Codex auth file.
 When `--case-runtime-module <path>` is passed, the command appends Case's native
 `--runtime-module <path>` flag and records the resolved path in
 `execution-request.json`. When `--case-dry-run` is passed, the command appends
