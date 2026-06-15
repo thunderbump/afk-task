@@ -1,14 +1,13 @@
-# Automation Simple Spike
+# Automation Simple Workflow
 
-Throwaway prototype for a simpler unattended automation shape:
+Workflow under development for unattended automation:
 
 ```text
 Beads selects and gates work -> Case owns workflow/review/PR -> Sandcastle sandboxes Case agent runs
 ```
 
-This is not production code. It is a runnable spike to test whether the existing
-automation coordinator can shrink by leaning on normal Case and Sandcastle
-boundaries.
+This repo develops the unattended workflow that lets the existing automation
+coordinator shrink by leaning on normal Case and Sandcastle boundaries.
 
 ## What This Pulls Together
 
@@ -61,20 +60,20 @@ local-only.
 ## Command
 
 ```sh
-python3 -m automation_simple_spike run --bead <bead-id>
+python3 -m automation_simple_workflow run --bead <bead-id>
 ```
 
 The runner needs a patched Case checkout. Either export it once:
 
 ```sh
 export CASE_CHECKOUT=/path/to/workos-case
-python3 -m automation_simple_spike run --bead <bead-id>
+python3 -m automation_simple_workflow run --bead <bead-id>
 ```
 
 or pass it per invocation:
 
 ```sh
-python3 -m automation_simple_spike run \
+python3 -m automation_simple_workflow run \
   --bead <bead-id> \
   --case-checkout /path/to/workos-case
 ```
@@ -83,20 +82,20 @@ For a bounded native Case plumbing test that does not spawn model-backed phase
 agents, pass:
 
 ```sh
-python3 -m automation_simple_spike run --bead <bead-id> --case-dry-run
+python3 -m automation_simple_workflow run --bead <bead-id> --case-dry-run
 ```
 
 To pass a Case runtime adapter module through to native Case, pass:
 
 ```sh
-python3 -m automation_simple_spike run --bead <bead-id> --case-runtime-module <path>
+python3 -m automation_simple_workflow run --bead <bead-id> --case-runtime-module <path>
 ```
 
 To prepare native Case's default Pi transport to use a local Codex ChatGPT
 session token, pass:
 
 ```sh
-python3 -m automation_simple_spike run \
+python3 -m automation_simple_workflow run \
   --bead <bead-id> \
   --case-codex-session
 ```
@@ -111,7 +110,7 @@ token value is written by this wrapper.
 Useful wrapper options:
 
 ```sh
-python3 -m automation_simple_spike run \
+python3 -m automation_simple_workflow run \
   --bead <bead-id> \
   --case-codex-session \
   --codex-auth-file /path/to/auth.json \
@@ -129,7 +128,7 @@ with fake auth fixtures and fake Case commands.
 This repo includes one local proof module:
 
 ```sh
-python3 -m automation_simple_spike run \
+python3 -m automation_simple_workflow run \
   --bead central-hmd.5 \
   --case-runtime-module runtime_modules/host-monitor-dashboard-runtime.mjs
 ```
@@ -160,7 +159,7 @@ bd show <bead-id> --json
 from `/home/bump/Projects/beads`, loading `BEADS_DOLT_PASSWORD` only into the
 `bd` subprocess environment from
 `/home/bump/Projects/beads/secrets/dolt_beads_password.txt`. The password is not
-written into spike state, task files, logs, or Case environment.
+written into wrapper state, task files, logs, or Case environment.
 
 For tests and smoke runs, pass `--bead-json <path>` or fake `--bd-command`.
 
@@ -178,7 +177,7 @@ For tests and smoke runs, pass `--bead-json <path>` or fake `--bd-command`.
 4. Write normal repo-local Case task files:
    `<target_repo_path>/.case/tasks/active/<bead-id>.md`
    and `<bead-id>.task.json`.
-5. Write Case project state under the spike state dir:
+5. Write Case project state under the wrapper state dir:
    `.automation-simple/case-data/projects.json`.
 6. Write a run request under:
    `.automation-simple/runs/<run-id>/execution-request.json`.
@@ -188,7 +187,7 @@ For tests and smoke runs, pass `--bead-json <path>` or fake `--bd-command`.
 bun src/index.ts run --task <task-json> --mode unattended
 ```
 
-with `CASE_DATA_DIR`, `XDG_CONFIG_HOME`, and `HOME` pointed at the spike-owned
+with `CASE_DATA_DIR`, `XDG_CONFIG_HOME`, and `HOME` pointed at the wrapper-owned
 Case data dir. Beads environment variables are removed before invoking Case.
 Ambient `OPENAI_API_KEY` and `PI_CODING_AGENT_DIR` are also removed unless
 `--case-codex-session` is enabled. In wrapper mode, `PI_CODING_AGENT_DIR` points
@@ -205,7 +204,7 @@ When `--case-runtime-module <path>` is passed, the command appends Case's native
 `--runtime-module <path>` flag and records the resolved path in
 `execution-request.json`. When `--case-dry-run` is passed, the command appends
 Case's native `--dry-run` flag. If native Case mutates the generated task JSON
-during dry-run, the spike archives that native copy in the run directory as
+during dry-run, the wrapper archives that native copy in the run directory as
 `native-dry-run-task.json` and restores the generated task JSON in the target
 repo.
 
@@ -214,18 +213,18 @@ repo.
 The target cron entry is one bead per tick, with an external lock if needed:
 
 ```cron
-*/15 * * * * cd /home/bump/Projects/automation-simple-spike && /usr/bin/python3 -m automation_simple_spike run --bead central-abc.1 >> .automation-simple/logs/run-$(date +\%F).log 2>&1
+*/15 * * * * cd /path/to/automation-simple-workflow && /usr/bin/python3 -m automation_simple_workflow run --bead central-abc.1 >> .automation-simple/logs/run-$(date +\%F).log 2>&1
 ```
 
 For a real overnight runner, add task selection ahead of this command or have
-cron pass a bead id selected by Beads. This spike intentionally starts with a
-single explicit bead id.
+cron pass a bead id selected by Beads. The current runner starts with a single
+explicit bead id.
 
 ## Why This Is Simpler
 
 The current automation repo owns Beads selection, review worktree creation,
 run archives, Sandcastle backend invocation, host validation, review gate state,
-and later Case handoff. This spike removes most of that coordinator surface:
+and later Case handoff. This workflow removes most of that coordinator surface:
 
 - Beads remains the source of task readiness and policy metadata.
 - Case receives a native task file and owns scout, implement, verify, review,

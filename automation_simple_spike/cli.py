@@ -43,7 +43,7 @@ class CaseCodexSession:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="automation-simple-spike")
+    parser = argparse.ArgumentParser(prog="automation-simple-workflow")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run = subparsers.add_parser("run")

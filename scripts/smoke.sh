@@ -53,7 +53,7 @@ bead_json.write_text(
     json.dumps(
         {
             "id": "central-smoke.1",
-            "title": "Smoke simple automation spike",
+            "title": "Smoke simple automation workflow",
             "description": "Exercise the fake Case handoff path.",
             "status": "open",
             "labels": ["project:automation", "ready-for-agent"],
@@ -75,7 +75,7 @@ PY
 (
   cd "$repo_root"
   BEADS_DOLT_PASSWORD="should-not-reach-case" \
-    python3 -m automation_simple_spike run \
+    python3 -m automation_simple_workflow run \
       --bead central-smoke.1 \
       --bead-json "$bead_json" \
       --state-dir "$state_dir" \

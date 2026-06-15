@@ -19,7 +19,7 @@ def run_cli(
     *args: str, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "automation_simple_spike", *args],
+        [sys.executable, "-m", "automation_simple_workflow", *args],
         cwd=REPO_ROOT,
         env={**os.environ, **(env or {})},
         text=True,
