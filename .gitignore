@@ -1,4 +1,9 @@
 .automation-simple/
+.case/
+node_modules/
+workos-case/
+sandcastle/
+.external/
 __pycache__/
 *.py[cod]
 .pytest_cache/

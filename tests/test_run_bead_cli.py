@@ -310,6 +310,99 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertNotIn("ambient-openai-key", json.dumps(execution_request))
             self.assertNotIn("must-not-reach-case", json.dumps(execution_request))
 
+    def test_case_checkout_can_come_from_environment(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "  'cwd': os.getcwd(),",
+                        "}) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.10")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.10",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-command",
+                str(fake_case),
+                env={"CASE_CHECKOUT": str(case_checkout)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            fake_case_record = json.loads(
+                fake_case.with_suffix(".json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(fake_case_record["cwd"], str(case_checkout))
+            execution_request = json.loads(
+                next((state_dir / "runs").glob("*/execution-request.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(execution_request["case_checkout"], str(case_checkout))
+
+    def test_missing_case_checkout_configuration_stops_before_case_state(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "from pathlib import Path",
+                        "Path(__file__).with_suffix('.json').write_text('ran\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.11")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.11",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-command",
+                str(fake_case),
+                env={"CASE_CHECKOUT": ""},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("pass --case-checkout", result.stderr)
+            self.assertIn("CASE_CHECKOUT", result.stderr)
+            self.assertFalse(fake_case.with_suffix(".json").exists())
+            self.assertFalse((target_repo / ".case").exists())
+            self.assertFalse(state_dir.exists())
+
     def test_run_resets_existing_review_branch_to_base_before_invoking_case(
         self,
     ) -> None:

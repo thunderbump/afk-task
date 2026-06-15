@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--state-dir", default=".automation-simple")
     run.add_argument(
         "--case-checkout",
-        default="/home/bump/Projects/automation/.automation/cache/workos-case",
+        help="Path to the patched workos/case checkout. Defaults to CASE_CHECKOUT.",
     )
     run.add_argument("--case-data-dir")
     run.add_argument("--case-command", default="bun")
@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             bead_id=args.bead,
             bead_json=Path(args.bead_json) if args.bead_json else None,
             state_dir=Path(args.state_dir),
-            case_checkout=Path(args.case_checkout),
+            case_checkout=configured_case_checkout(args.case_checkout),
             case_data_dir=Path(args.case_data_dir) if args.case_data_dir else None,
             case_command=args.case_command,
             case_dry_run=args.case_dry_run,
@@ -97,12 +97,19 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def configured_case_checkout(raw_value: str | None) -> Path | None:
+    raw_checkout = raw_value or os.environ.get("CASE_CHECKOUT")
+    if raw_checkout is None or not raw_checkout.strip():
+        return None
+    return Path(raw_checkout).expanduser()
+
+
 def run_bead(
     *,
     bead_id: str,
     bead_json: Path | None,
     state_dir: Path,
-    case_checkout: Path,
+    case_checkout: Path | None,
     case_data_dir: Path | None,
     case_command: str,
     case_dry_run: bool,
@@ -116,7 +123,6 @@ def run_bead(
     beads_password_file: Path,
 ) -> int:
     state_dir = state_dir.resolve()
-    case_checkout = case_checkout.resolve()
     if case_data_dir is not None:
         case_data_dir = case_data_dir.resolve()
     if case_runtime_module is not None:
@@ -146,6 +152,21 @@ def run_bead(
         except ValueError as error:
             print(f"run-bead codex session invalid: {error}", file=sys.stderr)
             return 1
+
+    if case_checkout is None:
+        print(
+            "run-bead missing Case checkout: pass --case-checkout "
+            "/path/to/workos-case or set CASE_CHECKOUT=/path/to/workos-case",
+            file=sys.stderr,
+        )
+        return 1
+    case_checkout = case_checkout.resolve()
+    if not case_checkout.is_dir():
+        print(
+            f"run-bead missing Case checkout: {case_checkout} is not a directory",
+            file=sys.stderr,
+        )
+        return 1
 
     metadata = issue["metadata"]
     target_repo = Path(str(metadata["target_repo_path"])).resolve()

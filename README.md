@@ -10,10 +10,73 @@ This is not production code. It is a runnable spike to test whether the existing
 automation coordinator can shrink by leaning on normal Case and Sandcastle
 boundaries.
 
+## What This Pulls Together
+
+- Beads is the task source. The wrapper reads one ready bead from the central
+  Beads workspace or a fixture JSON file, validates AFK metadata, and keeps
+  Beads credentials out of Case.
+- Case is the workflow engine. This repo generates normal Case task and project
+  state, then invokes an external patched `workos/case` checkout to run the
+  unattended pipeline.
+- Sandcastle is the sandbox runtime direction. The checked-in scaffold shows how
+  a Case `CaseAgentRuntime` adapter can call Sandcastle for each phase; the raw
+  Sandcastle repo and its dependencies are not vendored here.
+- Codex/Pi adapter state is generated locally only when
+  `--case-codex-session` is enabled. The wrapper writes non-secret model
+  selection under `.automation-simple/` and passes the access token only to the
+  child Case process.
+- The stitch point is intentionally small: Beads chooses the work, this wrapper
+  writes Case-compatible state, Case owns the workflow, and the Sandcastle
+  adapter is the planned runtime boundary for sandboxed agent execution.
+
+## Setup
+
+This repo should be push-ready for `git@github.com:thunderbump/afk-task.git`
+without raw upstream checkouts, Sandcastle sources, `node_modules`, or local run
+state.
+
+Prepare the external Case checkout outside this repo:
+
+```sh
+git clone https://github.com/workos/case.git ../workos-case
+(cd ../workos-case && bun install)
+scripts/apply-case-patches.sh --case-checkout ../workos-case
+export CASE_CHECKOUT="$(cd ../workos-case && pwd)"
+```
+
+The patch script also accepts `CASE_CHECKOUT=/path/to/workos-case`. There is no
+machine-local default path; every fresh clone must set `CASE_CHECKOUT` or pass
+`--case-checkout /path/to/workos-case` to the runner.
+
+For Sandcastle work, keep dependencies in the external Case checkout or in a
+separate adapter package. The scaffold at
+`scaffolds/case-sandcastle-runtime-adapter.ts` imports `@ai-hero/sandcastle`
+and `@ai-hero/sandcastle/sandboxes/podman`; do not copy the raw Sandcastle repo
+or its `node_modules` into this repo.
+
+Generated local state is ignored by Git: `.automation-simple/`, `.case/`,
+`node_modules/`, `workos-case/`, `sandcastle/`, and `.external/` should remain
+local-only.
+
 ## Command
 
 ```sh
 python3 -m automation_simple_spike run --bead <bead-id>
+```
+
+The runner needs a patched Case checkout. Either export it once:
+
+```sh
+export CASE_CHECKOUT=/path/to/workos-case
+python3 -m automation_simple_spike run --bead <bead-id>
+```
+
+or pass it per invocation:
+
+```sh
+python3 -m automation_simple_spike run \
+  --bead <bead-id> \
+  --case-checkout /path/to/workos-case
 ```
 
 For a bounded native Case plumbing test that does not spawn model-backed phase
@@ -81,12 +144,12 @@ target repo cwd, its verifier phase runs
 The Case side of this proof currently lives as a local patch series, not a fork:
 
 ```sh
-scripts/apply-case-patches.sh
+scripts/apply-case-patches.sh --case-checkout /path/to/workos-case
 ```
 
-By default the script applies `patches/workos-case/*.patch` to
-`/home/bump/Projects/automation/.automation/cache/workos-case`. Set
-`CASE_CHECKOUT=/path/to/case` to apply it elsewhere.
+The script applies `patches/workos-case/*.patch` to the external checkout passed
+with `--case-checkout` or `CASE_CHECKOUT`. It intentionally has no default so a
+fresh clone does not depend on one machine's local checkout.
 
 By default the command reads central Beads with:
 
