@@ -10,6 +10,13 @@ case_checkout="$tmp/workos-case"
 state_dir="$tmp/.automation-simple"
 mkdir -p "$target_repo" "$case_checkout"
 
+git -C "$target_repo" init --initial-branch=main
+git -C "$target_repo" config user.email "smoke@example.com"
+git -C "$target_repo" config user.name "Smoke Test"
+printf 'smoke target\n' >"$target_repo/README.md"
+git -C "$target_repo" add README.md
+git -C "$target_repo" commit -m "Initial smoke target"
+
 fake_case="$tmp/fake-case"
 cat >"$fake_case" <<'PY'
 #!/usr/bin/env python3

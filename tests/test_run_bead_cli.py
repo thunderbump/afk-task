@@ -30,7 +30,34 @@ def run_cli(
 
 
 class RunBeadCliTest(unittest.TestCase):
-    def write_eligible_bead(self, path: Path, target_repo: Path, bead_id: str) -> None:
+    def git(self, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+
+    def init_target_repo(self, path: Path) -> str:
+        path.mkdir()
+        self.git(path, "init")
+        self.git(path, "config", "user.email", "test@example.com")
+        self.git(path, "config", "user.name", "Test User")
+        (path / "README.md").write_text("fixture target\n", encoding="utf-8")
+        self.git(path, "add", "README.md")
+        self.git(path, "commit", "-m", "Initial target commit")
+        self.git(path, "branch", "-M", "main")
+        return self.git(path, "rev-parse", "main").stdout.strip()
+
+    def write_eligible_bead(
+        self,
+        path: Path,
+        target_repo: Path,
+        bead_id: str,
+        target_base_branch: str = "main",
+    ) -> None:
         path.write_text(
             json.dumps(
                 {
@@ -44,7 +71,7 @@ class RunBeadCliTest(unittest.TestCase):
                         "afk_runner": "codex",
                         "target_repo": "local/test",
                         "target_repo_path": str(target_repo),
-                        "target_base_branch": "main",
+                        "target_base_branch": target_base_branch,
                         "branch_policy": "independent",
                         "validation_command": "python3 -m unittest discover -s tests",
                     },
@@ -131,7 +158,7 @@ class RunBeadCliTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
-            target_repo.mkdir()
+            self.init_target_repo(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -283,13 +310,197 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertNotIn("ambient-openai-key", json.dumps(execution_request))
             self.assertNotIn("must-not-reach-case", json.dumps(execution_request))
 
+    def test_run_resets_existing_review_branch_to_base_before_invoking_case(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            base_sha = self.init_target_repo(target_repo)
+            self.git(target_repo, "checkout", "-b", "agent/central-32p")
+            (target_repo / "stale.txt").write_text("old run\n", encoding="utf-8")
+            self.git(target_repo, "add", "stale.txt")
+            self.git(
+                target_repo,
+                "commit",
+                "-m",
+                'Revert "feat(dashboard): add sample events section"',
+            )
+            stale_sha = self.git(target_repo, "rev-parse", "HEAD").stdout.strip()
+            self.git(target_repo, "checkout", "main")
+
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "  'cwd': os.getcwd(),",
+                        "}) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-32p")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-32p",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(fake_case.with_suffix(".json").is_file())
+            self.assertEqual(
+                self.git(target_repo, "branch", "--show-current").stdout.strip(),
+                "agent/central-32p",
+            )
+            self.assertEqual(
+                self.git(target_repo, "rev-parse", "HEAD").stdout.strip(),
+                base_sha,
+            )
+            self.assertNotIn(
+                stale_sha,
+                self.git(target_repo, "log", "--format=%H", "main..agent/central-32p")
+                .stdout
+                .splitlines(),
+            )
+            self.assertNotIn(
+                'Revert "feat(dashboard): add sample events section"',
+                self.git(
+                    target_repo,
+                    "log",
+                    "--format=%s",
+                    "main..agent/central-32p",
+                ).stdout,
+            )
+
+    def test_dirty_target_repo_stops_before_case_invocation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            (target_repo / "dirty.txt").write_text("unsaved work\n", encoding="utf-8")
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "from pathlib import Path",
+                        "Path(__file__).with_suffix('.json').write_text('ran\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-dirty")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-dirty",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("target repo has uncommitted changes", result.stderr)
+            self.assertFalse(fake_case.with_suffix(".json").exists())
+            self.assertFalse((target_repo / ".case").exists())
+
+    def test_invalid_target_repo_stops_before_case_invocation(self) -> None:
+        cases = [
+            ("not-git", False, "main", "is not a git repository"),
+            (
+                "missing-base",
+                True,
+                "missing",
+                "target base branch does not exist locally: missing",
+            ),
+        ]
+        for name, initialize_git, target_base_branch, expected_error in cases:
+            with self.subTest(name=name), TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                target_repo = tmp_path / "target"
+                if initialize_git:
+                    self.init_target_repo(target_repo)
+                else:
+                    target_repo.mkdir()
+                state_dir = tmp_path / ".automation-simple"
+                case_checkout = tmp_path / "workos-case"
+                case_checkout.mkdir()
+                fake_case = tmp_path / "fake-case"
+                fake_case.write_text(
+                    "\n".join(
+                        [
+                            "#!/usr/bin/env python3",
+                            "from pathlib import Path",
+                            "Path(__file__).with_suffix('.json').write_text('ran\\n', encoding='utf-8')",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                fake_case.chmod(0o755)
+                bead_json = tmp_path / "bead.json"
+                self.write_eligible_bead(
+                    bead_json,
+                    target_repo,
+                    f"central-{name}",
+                    target_base_branch=target_base_branch,
+                )
+
+                result = run_cli(
+                    "run",
+                    "--bead",
+                    f"central-{name}",
+                    "--bead-json",
+                    str(bead_json),
+                    "--state-dir",
+                    str(state_dir),
+                    "--case-checkout",
+                    str(case_checkout),
+                    "--case-command",
+                    str(fake_case),
+                )
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(fake_case.with_suffix(".json").exists())
+                self.assertFalse((target_repo / ".case").exists())
+
     def test_case_cli_shim_preserves_agent_cwd_and_uses_absolute_case_entrypoint(
         self,
     ) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
-            target_repo.mkdir()
+            self.init_target_repo(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -369,7 +580,7 @@ class RunBeadCliTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
-            target_repo.mkdir()
+            self.init_target_repo(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -583,7 +794,7 @@ class RunBeadCliTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
-            target_repo.mkdir()
+            self.init_target_repo(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -673,7 +884,7 @@ class RunBeadCliTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
-            target_repo.mkdir()
+            self.init_target_repo(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -774,7 +985,7 @@ class RunBeadCliTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
-            target_repo.mkdir()
+            self.init_target_repo(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -856,7 +1067,7 @@ class RunBeadCliTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
-            target_repo.mkdir()
+            self.init_target_repo(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -923,7 +1134,7 @@ class RunBeadCliTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
-            target_repo.mkdir()
+            self.init_target_repo(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -1033,7 +1244,7 @@ class RunBeadCliTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
-            target_repo.mkdir()
+            self.init_target_repo(target_repo)
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
             state_dir = f".automation-simple/test-{uuid4().hex}"

@@ -29,6 +29,10 @@ CODEX_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
 CODEX_TOKEN_EXPIRY_MARGIN_SECONDS = 300
 
 
+class TargetRepoPreparationError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class CaseCodexSession:
     access_token: str
@@ -147,6 +151,15 @@ def run_bead(
     target_repo = Path(str(metadata["target_repo_path"])).resolve()
     case_data = case_data_dir or state_dir / "case-data"
     review_branch = review_branch_for(bead_id=bead_id, metadata=metadata)
+    try:
+        prepare_target_review_branch(
+            target_repo=target_repo,
+            base_branch=str(metadata["target_base_branch"]),
+            review_branch=review_branch,
+        )
+    except TargetRepoPreparationError as error:
+        print(f"run-bead target repo invalid: {error}", file=sys.stderr)
+        return 1
     task_md, task_json = write_case_task(
         issue=issue,
         target_repo=target_repo,
@@ -398,6 +411,69 @@ def review_branch_for(*, bead_id: str, metadata: dict[str, Any]) -> str:
     if branch_policy == "independent":
         return f"agent/{bead_id}"
     return f"agent/{metadata['workstream_id']}"
+
+
+def prepare_target_review_branch(
+    *,
+    target_repo: Path,
+    base_branch: str,
+    review_branch: str,
+) -> None:
+    git_dir = run_target_git(target_repo, "rev-parse", "--git-dir")
+    if git_dir.returncode != 0:
+        raise TargetRepoPreparationError(f"{target_repo} is not a git repository")
+
+    status = run_target_git(target_repo, "status", "--porcelain")
+    if status.returncode != 0:
+        raise TargetRepoPreparationError(
+            f"could not inspect git status for {target_repo}: "
+            f"{git_error_message(status)}"
+        )
+    if status.stdout.strip():
+        raise TargetRepoPreparationError(
+            "target repo has uncommitted changes; commit, stash, or clean them first"
+        )
+
+    base = run_target_git(
+        target_repo,
+        "rev-parse",
+        "--verify",
+        f"refs/heads/{base_branch}^{{commit}}",
+    )
+    if base.returncode != 0:
+        raise TargetRepoPreparationError(
+            f"target base branch does not exist locally: {base_branch}"
+        )
+
+    checkout = run_target_git(target_repo, "checkout", "-B", review_branch, base_branch)
+    if checkout.returncode != 0:
+        raise TargetRepoPreparationError(
+            f"could not reset review branch {review_branch} to {base_branch}: "
+            f"{git_error_message(checkout)}"
+        )
+
+
+def run_target_git(target_repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=target_repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(
+            ["git", *args],
+            128,
+            "",
+            f"missing path or git executable: {target_repo}",
+        )
+
+
+def git_error_message(result: subprocess.CompletedProcess[str]) -> str:
+    return (result.stderr or result.stdout).strip() or f"git exited {result.returncode}"
 
 
 def write_case_task(
