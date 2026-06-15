@@ -39,13 +39,19 @@ Prepare the external Case checkout outside this repo:
 ```sh
 git clone https://github.com/workos/case.git ../workos-case
 (cd ../workos-case && bun install)
+(cd ../workos-case && git config user.email "agent@example.invalid")
+(cd ../workos-case && git config user.name "Automation Workflow")
 scripts/apply-case-patches.sh --case-checkout ../workos-case
+(cd ../workos-case && bun run generate:assets)
 export CASE_CHECKOUT="$(cd ../workos-case && pwd)"
 ```
 
 The patch script also accepts `CASE_CHECKOUT=/path/to/workos-case`. There is no
 machine-local default path; every fresh clone must set `CASE_CHECKOUT` or pass
-`--case-checkout /path/to/workos-case` to the runner.
+`--case-checkout /path/to/workos-case` to the runner. The `git config` commands
+are local to the Case checkout and let `git am` apply the patch series on a
+machine that has no global Git identity configured. `bun run generate:assets`
+refreshes Case's generated package asset list after the patches are applied.
 
 For Sandcastle work, keep dependencies in the external Case checkout or in a
 separate adapter package. The scaffold at
@@ -162,6 +168,64 @@ from `/home/bump/Projects/beads`, loading `BEADS_DOLT_PASSWORD` only into the
 written into wrapper state, task files, logs, or Case environment.
 
 For tests and smoke runs, pass `--bead-json <path>` or fake `--bd-command`.
+
+## Fresh Clone Smoke
+
+After cloning this repo and preparing Case, run the local validation commands:
+
+```sh
+python3 -m unittest discover -s tests
+scripts/smoke.sh
+```
+
+`scripts/smoke.sh` uses a synthetic bead, a temporary target git repo, and a
+fake Case command. It does not read Beads secrets and does not call Codex, Pi, or
+GitHub.
+
+To prove the native Case dry-run path from a fresh clone without live model
+calls, create a temporary target repo and fixture bead:
+
+```sh
+tmp="$(mktemp -d)"
+target="$tmp/target"
+mkdir -p "$target"
+git -C "$target" init
+git -C "$target" config user.email "agent@example.invalid"
+git -C "$target" config user.name "Automation Workflow"
+printf 'native dry-run target\n' > "$target/README.md"
+git -C "$target" add README.md
+git -C "$target" commit -m "Initial target"
+git -C "$target" branch -M main
+
+cat > "$tmp/bead.json" <<EOF
+{
+  "id": "central-audit.1",
+  "title": "Audit native dry-run handoff",
+  "description": "Exercise native Case dry-run from a fresh workflow clone.",
+  "status": "open",
+  "labels": ["project:automation", "ready-for-agent"],
+  "metadata": {
+    "afk_enabled": true,
+    "afk_runner": "codex",
+    "target_repo": "local/audit",
+    "target_repo_path": "$target",
+    "target_base_branch": "main",
+    "branch_policy": "independent",
+    "validation_command": "true"
+  }
+}
+EOF
+
+python3 -m automation_simple_workflow run \
+  --bead central-audit.1 \
+  --bead-json "$tmp/bead.json" \
+  --state-dir "$tmp/.automation-simple" \
+  --case-checkout "$CASE_CHECKOUT" \
+  --case-dry-run
+```
+
+That command invokes native Case with `--dry-run`, writes task state under the
+temporary target repo, and should finish without live Codex/Pi credentials.
 
 ## Current Flow
 
