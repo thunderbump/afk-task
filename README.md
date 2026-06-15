@@ -198,9 +198,11 @@ the same interface and call Sandcastle from each Case phase.
 The local Case patches add `run --runtime-module <path>`, which dynamically
 imports a module exporting `createCaseRuntime()`, a default runtime factory, or
 a default runtime object. They also keep task status at `closing` when the close
-phase completes without a PR URL, and preserve detailed `tested`/`reviewed`
+phase completes without a PR URL, preserve detailed `tested`/`reviewed`
 evidence marker files when event projections notice a completed verify or
-review phase. Pi remains the default runtime when no module is supplied.
+review phase, and merge task JSON projections without regressing externally
+recorded evidence flags or completed agent phases. Pi remains the default
+runtime when no module is supplied.
 
 ## Sandcastle Findings
 

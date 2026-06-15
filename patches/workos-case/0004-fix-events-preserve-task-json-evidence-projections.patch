@@ -1,0 +1,298 @@
+From 475106d8a3b43d0b32ea3f56b32cdb436fcc2e39 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sun, 14 Jun 2026 22:02:54 -0700
+Subject: [PATCH 4/4] Preserve task evidence during projections
+
+---
+ src/__tests__/events-appender.spec.ts | 64 +++++++++++++++++++++-
+ src/__tests__/task-store.spec.ts      | 76 +++++++++++++++++++++++++++
+ src/events/appender.ts                | 17 ++++++
+ src/state/task-store.ts               | 51 ++++++++++++++++--
+ 4 files changed, 203 insertions(+), 5 deletions(-)
+ create mode 100644 src/__tests__/task-store.spec.ts
+
+diff --git a/src/__tests__/events-appender.spec.ts b/src/__tests__/events-appender.spec.ts
+index 7223f82..b77873a 100644
+--- a/src/__tests__/events-appender.spec.ts
++++ b/src/__tests__/events-appender.spec.ts
+@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
+ import { EventAppender } from '../events/appender.js';
+ import { LifecycleValidationError } from '../events/errors.js';
+ import type { PlanArtifact } from '../events/plan.js';
++import { TaskStore } from '../state/task-store.js';
+ import type { TaskJson } from '../types.js';
+
+ const PLAN: PlanArtifact = {
+@@ -184,6 +185,51 @@ describe('EventAppender', () => {
+     expect(writtenProjections.length).toBeGreaterThanOrEqual(2);
+   });
+
++  test('preserves externally completed verification evidence when stale appender state projects', async () => {
++    await writeFile(
++      taskJsonPath,
++      JSON.stringify(
++        {
++          id: 'task-1',
++          status: 'active',
++          created: '2026-01-01T00:00:00Z',
++          repo: 'test-repo',
++          agents: {
++            verifier: {
++              started: '2026-06-15T00:00:00.000Z',
++              completed: '2026-06-15T00:01:00.000Z',
++              status: 'completed',
++            },
++          },
++          tested: true,
++          manualTested: true,
++          prUrl: null,
++          prNumber: null,
++        },
++        null,
++        2,
++      ) + '\n',
++    );
++    const markerPath = resolve(tmpDir, '.case/task-1/tested');
++    await mkdir(resolve(markerPath, '..'), { recursive: true });
++    await writeFile(markerPath, 'timestamp: 2026-06-15T00:01:00.000Z\n');
++    await writeFile(resolve(tmpDir, '.case/task-1/manual-tested'), 'timestamp: 2026-06-15T00:01:00.000Z\n');
++
++    const store = new TaskStore(taskJsonPath);
++    const appender = new EventAppender(tmpDir, 'task-1', 'run-stale-projection', store);
++
++    await appender.append({ event: 'pipeline_start', taskId: 'task-1', profile: 'standard', plan: PLAN });
++
++    const task = await store.read();
++    expect(task.tested).toBe(true);
++    expect(task.manualTested).toBe(true);
++    expect(task.agents.verifier).toEqual({
++      started: '2026-06-15T00:00:00.000Z',
++      completed: '2026-06-15T00:01:00.000Z',
++      status: 'completed',
++    });
++  });
++
+   test('throws when getState called before any events', () => {
+     const store = new MockTaskStore(taskJsonPath) as any;
+     const appender = new EventAppender(tmpDir, 'task-1', 'run-7', store);
+@@ -191,6 +237,21 @@ describe('EventAppender', () => {
+     expect(() => appender.getState()).toThrow('No events appended yet');
+   });
+
++  test('projects tested true from an existing marker file before marker state has seen it', async () => {
++    const markerPath = resolve(tmpDir, '.case/task-1/tested');
++    await mkdir(resolve(markerPath, '..'), { recursive: true });
++    await writeFile(markerPath, 'timestamp: 2026-06-15T00:01:00.000Z\n');
++
++    const store = new MockTaskStore(taskJsonPath) as any;
++    const appender = new EventAppender(tmpDir, 'task-1', 'run-existing-tested-marker', store);
++
++    await appender.append({ event: 'pipeline_start', taskId: 'task-1', profile: 'standard', plan: PLAN });
++
++    const task = await store.read();
++    expect(task.tested).toBe(true);
++    expect(appender.getState().markers.has('tested')).toBe(true);
++  });
++
+   test('writes tested marker file on verify phase_end completed', async () => {
+     const store = new MockTaskStore(taskJsonPath) as any;
+     const appender = new EventAppender(tmpDir, 'task-1', 'run-marker-1', store);
+@@ -294,8 +355,7 @@ describe('EventAppender', () => {
+
+   test('preserves existing reviewed marker evidence when review phase completes', async () => {
+     const markerPath = resolve(tmpDir, '.case/task-1/reviewed');
+-    const markerContent =
+-      'timestamp: 2026-06-15T00:00:00.000Z\ncritical: 0\nwarnings: 1\ninfo: 2\n';
++    const markerContent = 'timestamp: 2026-06-15T00:00:00.000Z\ncritical: 0\nwarnings: 1\ninfo: 2\n';
+     await mkdir(resolve(markerPath, '..'), { recursive: true });
+     await writeFile(markerPath, markerContent);
+
+diff --git a/src/__tests__/task-store.spec.ts b/src/__tests__/task-store.spec.ts
+new file mode 100644
+index 0000000..f0d08bb
+--- /dev/null
++++ b/src/__tests__/task-store.spec.ts
+@@ -0,0 +1,76 @@
++import { afterAll, beforeEach, describe, expect, test } from 'bun:test';
++import { mkdir, rm, writeFile } from 'node:fs/promises';
++import { resolve } from 'node:path';
++import { TaskStore } from '../state/task-store.js';
++import type { TaskJson } from '../types.js';
++
++const tmpDir = resolve(process.env.TMPDIR ?? '/tmp', `case-task-store-test-${Date.now()}`);
++let taskJsonPath: string;
++
++const BASE_TASK: TaskJson = {
++  id: 'task-1',
++  status: 'active',
++  created: '2026-01-01T00:00:00Z',
++  repo: 'test-repo',
++  agents: {},
++  tested: false,
++  manualTested: false,
++  prUrl: null,
++  prNumber: null,
++};
++
++beforeEach(async () => {
++  await mkdir(tmpDir, { recursive: true });
++  taskJsonPath = resolve(tmpDir, '.task.json');
++  await writeFile(taskJsonPath, JSON.stringify(BASE_TASK, null, 2) + '\n');
++});
++
++afterAll(async () => {
++  await rm(tmpDir, { recursive: true, force: true });
++});
++
++describe('TaskStore.writeFromProjection', () => {
++  test('does not regress existing evidence flags or completed agents from a stale projection', async () => {
++    await writeFile(
++      taskJsonPath,
++      JSON.stringify(
++        {
++          ...BASE_TASK,
++          agents: {
++            verifier: {
++              started: '2026-06-15T00:00:00.000Z',
++              completed: '2026-06-15T00:01:00.000Z',
++              status: 'completed',
++            },
++          },
++          tested: true,
++          manualTested: true,
++        },
++        null,
++        2,
++      ) + '\n',
++    );
++
++    const store = new TaskStore(taskJsonPath);
++    await store.writeFromProjection({
++      agents: {
++        verifier: {
++          started: '2026-06-15T00:00:00.000Z',
++          completed: null,
++          status: 'running',
++        },
++      },
++      tested: false,
++      manualTested: false,
++    });
++
++    const task = await store.read();
++    expect(task.tested).toBe(true);
++    expect(task.manualTested).toBe(true);
++    expect(task.agents.verifier).toEqual({
++      started: '2026-06-15T00:00:00.000Z',
++      completed: '2026-06-15T00:01:00.000Z',
++      status: 'completed',
++    });
++  });
++});
+diff --git a/src/events/appender.ts b/src/events/appender.ts
+index 297a0ba..c32ced7 100644
+--- a/src/events/appender.ts
++++ b/src/events/appender.ts
+@@ -69,6 +69,8 @@ export class EventAppender {
+   private async runProjections(): Promise<void> {
+     if (!this.state) return;
+
++    await this.hydrateExistingMarkers();
++
+     const taskJson = projectTaskJson(this.state);
+     await this.taskStore.writeFromProjection(taskJson);
+
+@@ -93,4 +95,19 @@ export class EventAppender {
+       await this.taskStore.writeFromProjection(updatedTaskJson);
+     }
+   }
++
++  private async hydrateExistingMarkers(): Promise<void> {
++    if (!this.state) return;
++
++    for (const marker of ['tested', 'manual-tested', 'reviewed']) {
++      if (this.state.markers.has(marker)) continue;
++
++      try {
++        await access(resolve(this.caseRoot, '.case', this.taskSlug, marker));
++        this.state.markers.add(marker);
++      } catch {
++        // Missing marker files are expected during normal runs.
++      }
++    }
++  }
+ }
+diff --git a/src/state/task-store.ts b/src/state/task-store.ts
+index c4199cf..7276a2f 100644
+--- a/src/state/task-store.ts
++++ b/src/state/task-store.ts
+@@ -1,6 +1,6 @@
+ import { writeFileSync } from 'node:fs';
+ import { resolve } from 'node:path';
+-import type { TaskJson } from '../types.js';
++import type { AgentName, AgentPhase, TaskJson } from '../types.js';
+
+ export class TaskStateError extends Error {
+   constructor(message: string) {
+@@ -42,8 +42,7 @@ export class TaskStore {
+
+   async writeFromProjection(projected: Partial<TaskJson>): Promise<void> {
+     const task = await this.read();
+-    Object.assign(task, projected);
+-    this.writeSync(task);
++    this.writeSync(mergeProjection(task, projected));
+   }
+
+   async setPendingRevision(revision: import('../types.js').RevisionRequest | null): Promise<void> {
+@@ -57,3 +56,49 @@ export class TaskStore {
+     writeFileSync(this.taskJsonPath, JSON.stringify(task, null, 2) + '\n');
+   }
+ }
++
++function mergeProjection(task: TaskJson, projected: Partial<TaskJson>): TaskJson {
++  const merged: TaskJson = {
++    ...task,
++    ...projected,
++  };
++
++  merged.agents = mergeProjectedAgents(task.agents, projected.agents);
++
++  if (task.tested && projected.tested === false) {
++    merged.tested = true;
++  }
++
++  if (task.manualTested && projected.manualTested === false) {
++    merged.manualTested = true;
++  }
++
++  return merged;
++}
++
++function mergeProjectedAgents(
++  current: TaskJson['agents'],
++  projected: Partial<Record<AgentName, AgentPhase>> | undefined,
++): TaskJson['agents'] {
++  if (!projected) return current;
++
++  const merged: TaskJson['agents'] = { ...current };
++
++  for (const [agent, projectedPhase] of Object.entries(projected) as Array<[AgentName, AgentPhase | undefined]>) {
++    if (!projectedPhase) continue;
++
++    const currentPhase = current[agent];
++    if (
++      currentPhase?.status === 'completed' &&
++      currentPhase.completed &&
++      (projectedPhase.status !== 'completed' || !projectedPhase.completed)
++    ) {
++      merged[agent] = currentPhase;
++      continue;
++    }
++
++    merged[agent] = projectedPhase;
++  }
++
++  return merged;
++}
+--
+2.43.0
