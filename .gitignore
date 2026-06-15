@@ -4,6 +4,13 @@ node_modules/
 workos-case/
 sandcastle/
 .external/
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+auth.json
 __pycache__/
 *.py[cod]
 .pytest_cache/
