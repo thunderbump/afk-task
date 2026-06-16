@@ -1065,7 +1065,6 @@ def write_execution_request(
 ) -> Path:
     metadata = issue["metadata"]
     validation_command = redact_sensitive_text(str(metadata["validation_command"]))
-    gate_approval = metadata.get("gate_approval")
     source_checkout = target_source_checkout or Path(
         str(metadata["target_repo_path"])
     ).resolve()
@@ -1100,9 +1099,6 @@ def write_execution_request(
                 "target_base_branch": metadata["target_base_branch"],
                 "review_branch": review_branch,
                 "validation_command": validation_command,
-                "gate_approval": (
-                    gate_approval if isinstance(gate_approval, dict) else None
-                ),
                 "sandcastle_runtime_adapter": {
                     "status": "scaffolded",
                     "interface": "CaseAgentRuntime",

@@ -466,13 +466,16 @@ class WorkstreamRunnerTest(unittest.TestCase):
             )
             self.assertFalse(marker_path.exists())
 
-    def test_human_gate_stops_before_case_execution(self) -> None:
+    def test_legacy_gate_metadata_does_not_block_afk_run_or_record_approval(
+        self,
+    ) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
             self.init_target_repo(target_repo)
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
+            state_dir = tmp_path / ".automation-simple"
             case_ran_path = tmp_path / "case-ran"
             fake_case = tmp_path / "fake-case"
             fake_case.write_text(
@@ -497,171 +500,13 @@ class WorkstreamRunnerTest(unittest.TestCase):
                     validation_command="true",
                 ),
                 "human_gates": ["Wait for maintainer approval before live Case."],
-            }
-            workstream_json = tmp_path / "workstream.json"
-            workstream_json.write_text(
-                json.dumps(
-                    [
-                        {
-                            "id": "central-3gj.2",
-                            "title": "Human gated child",
-                            "status": "open",
-                            "labels": ["project:automation", "ready-for-agent"],
-                            "metadata": metadata,
-                            "parent": "central-3gj",
-                        }
-                    ]
-                ),
-                encoding="utf-8",
-            )
-
-            result = run_cli(
-                "run-workstream",
-                "--parent",
-                "central-3gj",
-                "--workstream-json",
-                str(workstream_json),
-                "--state-dir",
-                str(tmp_path / ".automation-simple"),
-                "--case-checkout",
-                str(case_checkout),
-                "--case-command",
-                str(fake_case),
-            )
-
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("run-workstream gated before central-3gj.2", result.stderr)
-            self.assertIn("Wait for maintainer approval", result.stderr)
-            self.assertFalse(case_ran_path.exists())
-
-    def test_human_gate_writes_beads_comment_when_lifecycle_is_enabled(self) -> None:
-        with TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            target_repo = tmp_path / "target"
-            self.init_target_repo(target_repo)
-            case_checkout = tmp_path / "workos-case"
-            case_checkout.mkdir()
-            beads_workspace = tmp_path / "beads"
-            beads_workspace.mkdir()
-            password_file = tmp_path / "beads-password.txt"
-            password_file.write_text("fixture-password\n", encoding="utf-8")
-            transcript_path = tmp_path / "bd-transcript.json"
-            fake_bd = tmp_path / "fake-bd"
-            fake_bd.write_text(
-                "\n".join(
-                    [
-                        "#!/usr/bin/env python3",
-                        "import json, os, sys",
-                        "from pathlib import Path",
-                        "path = Path(os.environ['FAKE_BD_TRANSCRIPT'])",
-                        "items = json.loads(path.read_text(encoding='utf-8')) if path.exists() else []",
-                        "items.append({",
-                        "  'argv': sys.argv[1:],",
-                        "  'stdin': sys.stdin.read(),",
-                        "  'has_password': bool(os.environ.get('BEADS_DOLT_PASSWORD')),",
-                        "})",
-                        "path.write_text(json.dumps(items, indent=2) + '\\n', encoding='utf-8')",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            fake_bd.chmod(0o755)
-            gate_text = "Wait for maintainer approval before live Case."
-            workstream_json = tmp_path / "workstream.json"
-            workstream_json.write_text(
-                json.dumps(
-                    [
-                        {
-                            "id": "central-3gj.2",
-                            "title": "Human gated child",
-                            "status": "open",
-                            "labels": ["project:automation", "ready-for-agent"],
-                            "metadata": {
-                                **self.runnable_metadata(
-                                    target_repo,
-                                    light_command=None,
-                                    validation_command="true",
-                                ),
-                                "human_gates": [gate_text],
-                            },
-                            "parent": "central-3gj",
-                        }
-                    ]
-                ),
-                encoding="utf-8",
-            )
-
-            result = run_cli(
-                "run-workstream",
-                "--parent",
-                "central-3gj",
-                "--workstream-json",
-                str(workstream_json),
-                "--state-dir",
-                str(tmp_path / ".automation-simple"),
-                "--case-checkout",
-                str(case_checkout),
-                "--case-command",
-                "false",
-                "--bd-command",
-                str(fake_bd),
-                "--beads-workspace",
-                str(beads_workspace),
-                "--beads-password-file",
-                str(password_file),
-                "--beads-lifecycle",
-                env={"FAKE_BD_TRANSCRIPT": str(transcript_path)},
-            )
-
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                transcript[0]["argv"],
-                ["comment", "central-3gj.2", "--stdin"],
-            )
-            self.assertTrue(transcript[0]["has_password"])
-            self.assertIn("AFK run stopped at a gate", transcript[0]["stdin"])
-            self.assertIn(gate_text, transcript[0]["stdin"])
-            self.assertIn("gate_approval_id", transcript[0]["stdin"])
-
-    def test_approved_human_gate_runs_and_records_approval_evidence(self) -> None:
-        with TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            target_repo = tmp_path / "target"
-            self.init_target_repo(target_repo)
-            case_checkout = tmp_path / "workos-case"
-            case_checkout.mkdir()
-            state_dir = tmp_path / ".automation-simple"
-            case_ran_path = tmp_path / "case-ran"
-            gate_text = "Wait for maintainer approval before live Case."
-            fake_case = tmp_path / "fake-case"
-            fake_case.write_text(
-                "\n".join(
-                    [
-                        "#!/usr/bin/env python3",
-                        "from pathlib import Path",
-                        (
-                            f"Path({str(case_ran_path)!r}).write_text("
-                            "'ran\\n', encoding='utf-8')"
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            fake_case.chmod(0o755)
-            metadata = {
-                **self.runnable_metadata(
-                    target_repo,
-                    light_command=None,
-                    validation_command="true",
-                ),
-                "human_gates": [gate_text],
+                "environment_gates": ["Requires live model access."],
+                "stop_conditions": ["Stop if fixture asks for approval."],
+                "gates": ["Legacy generic gate."],
                 "gate_approval_id": "approval-central-3gj.2",
                 "gate_approved_by": "bump",
                 "gate_approved_at": "2026-06-16T04:30:00Z",
-                "gate_approved_for": gate_text,
+                "gate_approved_for": "A different gate.",
             }
             workstream_json = tmp_path / "workstream.json"
             workstream_json.write_text(
@@ -669,7 +514,7 @@ class WorkstreamRunnerTest(unittest.TestCase):
                     [
                         {
                             "id": "central-3gj.2",
-                            "title": "Approved human gated child",
+                            "title": "Human gated child",
                             "status": "open",
                             "labels": ["project:automation", "ready-for-agent"],
                             "metadata": metadata,
@@ -696,95 +541,10 @@ class WorkstreamRunnerTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertTrue(case_ran_path.exists())
-            self.assertIn(
-                "run-workstream approved gate for central-3gj.2",
-                result.stdout,
-            )
+            self.assertNotIn("run-workstream gated before", result.stderr)
             request = json.loads(
                 next(state_dir.glob("runs/*/execution-request.json")).read_text(
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(
-                request["gate_approval"],
-                {
-                    "approved": True,
-                    "approved_at": "2026-06-16T04:30:00Z",
-                    "approved_by": "bump",
-                    "approved_for": gate_text,
-                    "approval_id": "approval-central-3gj.2",
-                    "gates": [gate_text],
-                },
-            )
-
-    def test_gate_approval_must_match_configured_gate_scope(self) -> None:
-        with TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            target_repo = tmp_path / "target"
-            self.init_target_repo(target_repo)
-            case_checkout = tmp_path / "workos-case"
-            case_checkout.mkdir()
-            case_ran_path = tmp_path / "case-ran"
-            gate_text = "Wait for maintainer approval before live Case."
-            fake_case = tmp_path / "fake-case"
-            fake_case.write_text(
-                "\n".join(
-                    [
-                        "#!/usr/bin/env python3",
-                        "from pathlib import Path",
-                        (
-                            f"Path({str(case_ran_path)!r}).write_text("
-                            "'ran\\n', encoding='utf-8')"
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            fake_case.chmod(0o755)
-            metadata = {
-                **self.runnable_metadata(
-                    target_repo,
-                    light_command=None,
-                    validation_command="true",
-                ),
-                "human_gates": [gate_text],
-                "gate_approval_id": "approval-central-3gj.2",
-                "gate_approved_by": "bump",
-                "gate_approved_at": "2026-06-16T04:30:00Z",
-                "gate_approved_for": "A different gate.",
-            }
-            workstream_json = tmp_path / "workstream.json"
-            workstream_json.write_text(
-                json.dumps(
-                    [
-                        {
-                            "id": "central-3gj.2",
-                            "title": "Mismatched approval",
-                            "status": "open",
-                            "labels": ["project:automation", "ready-for-agent"],
-                            "metadata": metadata,
-                            "parent": "central-3gj",
-                        }
-                    ]
-                ),
-                encoding="utf-8",
-            )
-
-            result = run_cli(
-                "run-workstream",
-                "--parent",
-                "central-3gj",
-                "--workstream-json",
-                str(workstream_json),
-                "--state-dir",
-                str(tmp_path / ".automation-simple"),
-                "--case-checkout",
-                str(case_checkout),
-                "--case-command",
-                str(fake_case),
-            )
-
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("run-workstream gated before central-3gj.2", result.stderr)
-            self.assertFalse(case_ran_path.exists())
+            self.assertNotIn("gate_approval", request)

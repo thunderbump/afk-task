@@ -9,7 +9,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from .beads_lifecycle import BeadsLifecycleClient, BeadsLifecycleError
 from .cli import (
     eligibility_rejections,
     review_branch_for,
@@ -18,9 +17,6 @@ from .cli import (
 from .workstream_context import (
     ENVIRONMENT_GATE_METADATA_KEYS,
     LIKELY_FILE_METADATA_KEYS,
-    metadata_gates,
-    redact_sensitive_text,
-    string_list,
 )
 from .workstream_selection import (
     WorkstreamSelectionError,
@@ -33,20 +29,6 @@ from .workstream_selection import (
 )
 
 
-HUMAN_GATE_METADATA_KEYS = (
-    "human_gate",
-    "human_gates",
-    "environment_gate",
-    *ENVIRONMENT_GATE_METADATA_KEYS,
-)
-
-GATE_APPROVAL_METADATA_KEYS = (
-    "gate_approval_id",
-    "gate_approved_by",
-    "gate_approved_at",
-    "gate_approved_for",
-)
-
 SAFE_METADATA_KEYS = {
     "afk_enabled",
     "afk_runner",
@@ -57,10 +39,8 @@ SAFE_METADATA_KEYS = {
     "validation_command",
     "light_verification_command",
     "workstream_id",
-    "gate_approval",
-    *GATE_APPROVAL_METADATA_KEYS,
     *LIKELY_FILE_METADATA_KEYS,
-    *HUMAN_GATE_METADATA_KEYS,
+    *ENVIRONMENT_GATE_METADATA_KEYS,
 }
 
 SANITIZED_ENV_KEYS = (
@@ -217,46 +197,10 @@ def run_workstream_issues(
 
             issue = runnable[0]
             issue_id = str(issue["id"])
-            gates = configured_gates(issue)
-            gate_approval = approved_gate_evidence(issue, gates) if gates else None
-            if gates and gate_approval is None:
-                if beads_lifecycle:
-                    lifecycle_client = BeadsLifecycleClient(
-                        bd_command=bd_command,
-                        beads_workspace=beads_workspace,
-                        beads_password_file=beads_password_file,
-                    )
-                    try:
-                        lifecycle_client.record_gate_stop(
-                            bead_id=issue_id,
-                            gates=gates,
-                        )
-                    except BeadsLifecycleError as error:
-                        print(
-                            "run-workstream lifecycle gate comment failed: "
-                            f"{error}",
-                            file=sys.stderr,
-                        )
-                print(
-                    f"run-workstream gated before {issue_id}: {gates[0]}",
-                    file=sys.stderr,
-                )
-                return 1
-            if gate_approval is not None:
-                print(
-                    "run-workstream approved gate for "
-                    f"{issue_id}: {gate_approval['approval_id']}"
-                )
-
             issue_for_run = issue_with_shared_checkout(
                 issue,
                 shared_checkout=shared_checkout,
             )
-            if gate_approval is not None:
-                issue_for_run = issue_with_gate_approval(
-                    issue_for_run,
-                    gate_approval=gate_approval,
-                )
             per_bead_checkout_mode = target_checkout_mode
             skip_target_preparation = False
             if shared_checkout is not None and uses_shared_sequential_branch(issue):
@@ -394,18 +338,6 @@ def issue_with_shared_checkout(
 def uses_shared_sequential_branch(issue: dict[str, Any]) -> bool:
     metadata = issue.get("metadata") or {}
     return metadata.get("branch_policy") == "shared-sequential"
-
-
-def issue_with_gate_approval(
-    issue: dict[str, Any],
-    *,
-    gate_approval: dict[str, Any],
-) -> dict[str, Any]:
-    adjusted = deepcopy(issue)
-    metadata = dict(adjusted["metadata"])
-    metadata["gate_approval"] = gate_approval
-    adjusted["metadata"] = metadata
-    return adjusted
 
 
 def run_light_verification(*, issue: dict[str, Any], cwd: Path) -> int:
@@ -558,59 +490,6 @@ def blocked_dependency_issues(
         ):
             blocked.append(normalized)
     return blocked
-
-
-def configured_gates(issue: dict[str, Any]) -> list[str]:
-    metadata = issue.get("metadata") or {}
-    gates = metadata_gates(metadata)
-    for key in HUMAN_GATE_METADATA_KEYS:
-        gates.extend(string_list(metadata.get(key)))
-    deduplicated: list[str] = []
-    seen: set[str] = set()
-    for gate in gates:
-        redacted = redact_sensitive_text(gate)
-        if redacted not in seen:
-            deduplicated.append(redacted)
-            seen.add(redacted)
-    return deduplicated
-
-
-def approved_gate_evidence(
-    issue: dict[str, Any],
-    gates: list[str],
-) -> dict[str, Any] | None:
-    metadata = issue.get("metadata") or {}
-    approval_id = metadata.get("gate_approval_id")
-    approved_by = metadata.get("gate_approved_by")
-    approved_at = metadata.get("gate_approved_at")
-    approved_for = string_list(metadata.get("gate_approved_for"))
-    if (
-        not isinstance(approval_id, str)
-        or not approval_id.strip()
-        or not isinstance(approved_by, str)
-        or not approved_by.strip()
-        or not isinstance(approved_at, str)
-        or not approved_at.strip()
-        or not approved_for
-    ):
-        return None
-
-    approved_scope = {redact_sensitive_text(value) for value in approved_for}
-    approved_scope_lower = {value.lower() for value in approved_scope}
-    if "*" not in approved_scope and "all" not in approved_scope_lower:
-        if any(gate not in approved_scope for gate in gates):
-            return None
-
-    return {
-        "approved": True,
-        "approved_at": redact_sensitive_text(approved_at.strip()),
-        "approved_by": redact_sensitive_text(approved_by.strip()),
-        "approved_for": redact_sensitive_text(
-            approved_for[0] if len(approved_for) == 1 else "\n".join(approved_for)
-        ),
-        "approval_id": redact_sensitive_text(approval_id.strip()),
-        "gates": gates,
-    }
 
 
 def safe_workstream_context_fixture(

@@ -3,7 +3,7 @@
 Workflow under development for unattended automation:
 
 ```text
-Beads selects and gates work -> Case owns workflow/review/PR -> Sandcastle sandboxes Case agent runs
+Beads selects work and models readiness -> Case owns workflow/review/PR -> Sandcastle sandboxes Case agent runs
 ```
 
 This repo develops the unattended workflow that lets the existing automation
@@ -121,26 +121,15 @@ python3 -m automation_simple_workflow run-workstream --workstream-id <workstream
 context into each child task, reuses the shared review branch for
 `shared-sequential` beads, runs metadata `light_verification_command` after each
 successful child, and runs metadata `validation_command` once after the batch
-finishes. It stops before Case on configured `human_gates`,
-`environment_gates`, `stop_conditions`, or `gates`, and stops on Case, light
-verification, final validation, or dependency-blockage failures.
+finishes. It does not treat `human_gates`, `environment_gates`,
+`stop_conditions`, or `gates` metadata as approval stops; those fields may
+appear as task context, but they do not block an otherwise runnable AFK bead or
+add approval evidence to `execution-request.json`.
 
-Gate approval is only needed when one of those gate metadata fields is present.
-Approval is scoped and recorded in each approved bead's
-`execution-request.json` before Case starts:
-
-```json
-{
-  "human_gates": ["Live Codex/container proof may mount local auth and call a model."],
-  "gate_approval_id": "approval-2026-06-16-live-proof",
-  "gate_approved_by": "bump",
-  "gate_approved_at": "2026-06-16T04:30:00Z",
-  "gate_approved_for": "Live Codex/container proof may mount local auth and call a model."
-}
-```
-
-`gate_approved_for` must match the configured gate text. Use `*` only for an
-explicit approval that covers every gate on that bead.
+Model live or HITL work in Beads instead. Move that work to `ready-for-human`,
+leave/open a blocking dependency, or create a blocked follow-up bead with the
+same `project:<slug>` ownership label. Once the human-attended work is resolved,
+the AFK bead should be ordinary `ready-for-agent` work with its blockers closed.
 
 For fixture-driven tests or dry runs, pass preloaded workstream records:
 
@@ -288,8 +277,8 @@ The container image does not currently install or configure `bd`, so central
 Beads runs need either a fixture JSON via `--bead-json` or a later explicit
 Beads workspace/CLI mount. Live Codex-session runs likewise need an explicit
 read-only auth mount plus `--case-codex-session --codex-auth-file <mounted-path>`.
-For `run-workstream`, keep live Codex/container proofs behind `human_gates`
-until the bead has scoped `gate_approval_*` metadata from a human-attended run.
+For `run-workstream`, keep live Codex/container proofs as `ready-for-human` or
+blocked follow-up work until they are suitable for ordinary AFK execution.
 
 For a no-network synthetic proof, mount a temp directory containing the target
 repo, bead JSON, fake Case command, and fake Case checkout directory:
