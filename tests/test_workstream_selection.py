@@ -89,6 +89,31 @@ class WorkstreamSelectionTest(unittest.TestCase):
 
         self.assertEqual([issue["id"] for issue in selected], ["central-3gj.2"])
 
+    def test_selects_claimed_afk_children_without_active_run(self) -> None:
+        metadata = runnable_metadata()
+        issues = [
+            {
+                "id": "central-3gj.2",
+                "title": "Claimed child",
+                "status": "in_progress",
+                "labels": ["project:bump-eqemu", "ready-for-agent"],
+                "metadata": metadata,
+                "parent": "central-3gj",
+            },
+            {
+                "id": "central-3gj.3",
+                "title": "Already running child",
+                "status": "in_progress",
+                "labels": ["project:bump-eqemu", "ready-for-agent"],
+                "metadata": {**metadata, "active_run_id": "run-bead-central-3gj.3"},
+                "parent": "central-3gj",
+            },
+        ]
+
+        selected = select_runnable_workstream_beads(issues, parent_id="central-3gj")
+
+        self.assertEqual([issue["id"] for issue in selected], ["central-3gj.2"])
+
     def test_command_lists_runnable_parent_children_from_fake_bd(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

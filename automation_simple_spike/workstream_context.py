@@ -349,7 +349,7 @@ def readiness_label(
 
     metadata = safe_metadata(issue)
     labels = set(issue.get("labels") or [])
-    if issue.get("status") != "open":
+    if issue.get("status") not in {"open", "in_progress"}:
         return f"not ready: status {issue.get('status') or '<missing>'}"
     if "ready-for-agent" not in labels:
         return "not ready: missing ready-for-agent"

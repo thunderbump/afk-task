@@ -698,8 +698,8 @@ def eligibility_rejections(issue: dict[str, Any]) -> list[str]:
     labels = set(issue.get("labels") or [])
     reasons: list[str] = []
 
-    if issue.get("status") != "open":
-        reasons.append("expected open status")
+    if issue.get("status") not in {"open", "in_progress"}:
+        reasons.append("expected open or in_progress status")
 
     for field in REQUIRED_METADATA:
         if field not in metadata or metadata[field] in ("", None):
