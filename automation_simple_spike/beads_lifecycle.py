@@ -130,6 +130,25 @@ class BeadsLifecycleClient:
             args.extend(["--unset-metadata", key])
         self.run_bd(args)
 
+    def record_gate_stop(self, *, bead_id: str, gates: list[str]) -> None:
+        gate_lines = [f"- {gate}" for gate in gates] or ["- <unknown gate>"]
+        comment = "\n".join(
+            [
+                "AFK run stopped at a gate.",
+                "",
+                "Gate(s):",
+                *gate_lines,
+                "",
+                "Next action: approve this specific gate and rerun by setting:",
+                "- gate_approval_id=<approval-id>",
+                "- gate_approved_by=<approver>",
+                "- gate_approved_at=<timestamp>",
+                "- gate_approved_for=<exact gate text or *>",
+                "",
+            ]
+        )
+        self.run_bd(["comment", bead_id, "--stdin"], input_text=comment)
+
     def run_bd(self, args: list[str], *, input_text: str | None = None) -> None:
         try:
             result = subprocess.run(
@@ -149,4 +168,3 @@ class BeadsLifecycleClient:
             if not message:
                 message = f"bd {' '.join(args)} exited {result.returncode}"
             raise BeadsLifecycleError(message)
-

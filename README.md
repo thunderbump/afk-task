@@ -125,6 +125,23 @@ finishes. It stops before Case on configured `human_gates`,
 `environment_gates`, `stop_conditions`, or `gates`, and stops on Case, light
 verification, final validation, or dependency-blockage failures.
 
+Gate approval is only needed when one of those gate metadata fields is present.
+Approval is scoped and recorded in each approved bead's
+`execution-request.json` before Case starts:
+
+```json
+{
+  "human_gates": ["Live Codex/container proof may mount local auth and call a model."],
+  "gate_approval_id": "approval-2026-06-16-live-proof",
+  "gate_approved_by": "bump",
+  "gate_approved_at": "2026-06-16T04:30:00Z",
+  "gate_approved_for": "Live Codex/container proof may mount local auth and call a model."
+}
+```
+
+`gate_approved_for` must match the configured gate text. Use `*` only for an
+explicit approval that covers every gate on that bead.
+
 For fixture-driven tests or dry runs, pass preloaded workstream records:
 
 ```sh
@@ -271,6 +288,8 @@ The container image does not currently install or configure `bd`, so central
 Beads runs need either a fixture JSON via `--bead-json` or a later explicit
 Beads workspace/CLI mount. Live Codex-session runs likewise need an explicit
 read-only auth mount plus `--case-codex-session --codex-auth-file <mounted-path>`.
+For `run-workstream`, keep live Codex/container proofs behind `human_gates`
+until the bead has scoped `gate_approval_*` metadata from a human-attended run.
 
 For a no-network synthetic proof, mount a temp directory containing the target
 repo, bead JSON, fake Case command, and fake Case checkout directory:
