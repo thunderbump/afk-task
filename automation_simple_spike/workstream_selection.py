@@ -5,7 +5,8 @@ import re
 import subprocess
 from typing import Any, Iterable
 
-from .cli import beads_subprocess_env, eligibility_rejections
+from .beads_env import beads_subprocess_env
+from .cli import eligibility_rejections
 
 
 class WorkstreamSelectionError(RuntimeError):

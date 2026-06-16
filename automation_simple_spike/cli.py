@@ -14,6 +14,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .beads_env import beads_subprocess_env
+from .workstream_context import (
+    WorkstreamContext,
+    build_workstream_context,
+    redact_sensitive_text,
+    render_workstream_context_markdown,
+)
+from .beads_lifecycle import BeadsLifecycleClient, BeadsLifecycleError, LifecycleRun
 from .worktree import WorktreeProvisioningError, provision_target_worktree
 
 
@@ -51,6 +59,13 @@ def main(argv: list[str] | None = None) -> int:
     run = subparsers.add_parser("run")
     run.add_argument("--bead", required=True)
     run.add_argument("--bead-json")
+    run.add_argument(
+        "--workstream-context-json",
+        help=(
+            "Optional fixture JSON with parent/workstream issue records to project "
+            "into the generated Case task."
+        ),
+    )
     run.add_argument("--state-dir", default=".automation-simple")
     run.add_argument(
         "--case-checkout",
@@ -86,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
         "--beads-password-file",
         default="/home/bump/Projects/beads/secrets/dolt_beads_password.txt",
     )
+    run.add_argument("--beads-lifecycle", action="store_true")
+    run.add_argument("--close-bead-on-success", action="store_true")
 
     select = subparsers.add_parser("select-workstream")
     select_scope = select.add_mutually_exclusive_group(required=True)
@@ -104,6 +121,11 @@ def main(argv: list[str] | None = None) -> int:
         return run_bead(
             bead_id=args.bead,
             bead_json=Path(args.bead_json) if args.bead_json else None,
+            workstream_context_json=(
+                Path(args.workstream_context_json)
+                if args.workstream_context_json
+                else None
+            ),
             state_dir=Path(args.state_dir),
             case_checkout=configured_case_checkout(args.case_checkout),
             case_data_dir=Path(args.case_data_dir) if args.case_data_dir else None,
@@ -123,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
             bd_command=args.bd_command,
             beads_workspace=Path(args.beads_workspace),
             beads_password_file=Path(args.beads_password_file),
+            beads_lifecycle=args.beads_lifecycle,
+            close_bead_on_success=args.close_bead_on_success,
         )
     if args.command == "select-workstream":
         return select_workstream(
@@ -148,6 +172,7 @@ def run_bead(
     *,
     bead_id: str,
     bead_json: Path | None,
+    workstream_context_json: Path | None,
     state_dir: Path,
     case_checkout: Path | None,
     case_data_dir: Path | None,
@@ -163,7 +188,17 @@ def run_bead(
     bd_command: str,
     beads_workspace: Path,
     beads_password_file: Path,
+    beads_lifecycle: bool,
+    close_bead_on_success: bool,
 ) -> int:
+    if close_bead_on_success and not beads_lifecycle:
+        print(
+            "run-bead invalid lifecycle flags: --close-bead-on-success requires "
+            "--beads-lifecycle",
+            file=sys.stderr,
+        )
+        return 1
+
     state_dir = state_dir.resolve()
     if case_data_dir is not None:
         case_data_dir = case_data_dir.resolve()
@@ -179,6 +214,23 @@ def run_bead(
         beads_workspace=beads_workspace,
         beads_password_file=beads_password_file,
     )
+    lifecycle_client = (
+        BeadsLifecycleClient(
+            bd_command=bd_command,
+            beads_workspace=beads_workspace,
+            beads_password_file=beads_password_file,
+        )
+        if beads_lifecycle
+        else None
+    )
+    try:
+        workstream_context = load_workstream_context(
+            current_issue=issue,
+            workstream_context_json=workstream_context_json,
+        )
+    except ValueError as error:
+        print(f"run-bead workstream context invalid: {error}", file=sys.stderr)
+        return 1
     reasons = eligibility_rejections(issue)
     if reasons:
         print(f"run-bead ineligible: {bead_id}: {'; '.join(reasons)}", file=sys.stderr)
@@ -243,6 +295,7 @@ def run_bead(
         issue=issue,
         target_repo=target_repo,
         review_branch=review_branch,
+        workstream_context=workstream_context,
     )
     write_case_projects_manifest(
         case_data_dir=case_data,
@@ -274,6 +327,23 @@ def run_bead(
         target_worktree_checkout=target_worktree_checkout,
         codex_session=codex_session,
     )
+    lifecycle_run = None
+    if lifecycle_client is not None:
+        lifecycle_run = LifecycleRun(
+            bead_id=bead_id,
+            run_id=request_path.parent.name,
+            review_branch=review_branch,
+            target_checkout_mode=target_checkout_mode,
+            target_checkout_path=target_repo,
+            target_source_checkout=target_source_checkout,
+            target_worktree_checkout=target_worktree_checkout,
+            archive_path=request_path.parent,
+        )
+        try:
+            lifecycle_client.record_start(lifecycle_run)
+        except BeadsLifecycleError as error:
+            print(f"run-bead lifecycle start failed: {error}", file=sys.stderr)
+            return 1
     generated_task_json = task_json.read_text(encoding="utf-8") if case_dry_run else None
     result = run_case_command(
         case_command=case_command,
@@ -299,14 +369,33 @@ def run_bead(
         redactions=([codex_session.access_token] if codex_session is not None else None),
     )
     if interpreted_returncode != 0:
-        if result.returncode == 0:
-            print("run-bead failed: Case pipeline reported failure", file=sys.stderr)
-            return interpreted_returncode
-        print(
-            f"run-bead failed: Case command exited {result.returncode}",
-            file=sys.stderr,
-        )
+        failure_summary = case_failure_summary(result)
+        if lifecycle_client is not None and lifecycle_run is not None:
+            try:
+                lifecycle_client.record_failure(
+                    lifecycle_run,
+                    interpreted_exit_code=interpreted_returncode,
+                    failure_summary=failure_summary,
+                )
+            except BeadsLifecycleError as error:
+                print(
+                    f"run-bead lifecycle failure update failed: {error}",
+                    file=sys.stderr,
+                )
+        print(f"run-bead failed: {failure_summary}", file=sys.stderr)
         return interpreted_returncode
+
+    if lifecycle_client is not None and lifecycle_run is not None:
+        try:
+            lifecycle_client.record_success(
+                lifecycle_run,
+                commit_sha=target_head_commit(target_repo),
+                interpreted_exit_code=interpreted_returncode,
+                close_bead=close_bead_on_success,
+            )
+        except (BeadsLifecycleError, TargetRepoPreparationError) as error:
+            print(f"run-bead lifecycle success update failed: {error}", file=sys.stderr)
+            return 1
 
     print(f"run-bead handed off: {bead_id}")
     print(f"Case task JSON: {task_json}")
@@ -396,17 +485,35 @@ def load_issue(
     return payload
 
 
-def beads_subprocess_env(password_file: Path) -> dict[str, str]:
-    env = os.environ.copy()
-    if env.get("BEADS_DOLT_PASSWORD"):
-        return env
+def load_workstream_context(
+    *,
+    current_issue: dict[str, Any],
+    workstream_context_json: Path | None,
+) -> WorkstreamContext | None:
+    if workstream_context_json is None:
+        return None
     try:
-        password = password_file.read_text(encoding="utf-8").rstrip("\n")
-    except FileNotFoundError:
-        return env
-    if password:
-        env["BEADS_DOLT_PASSWORD"] = password
-    return env
+        payload = json.loads(workstream_context_json.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ValueError(f"{workstream_context_json} does not exist") from error
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{workstream_context_json} is not valid JSON") from error
+
+    if isinstance(payload, list):
+        issues = payload
+    elif isinstance(payload, dict):
+        raw_issues = payload.get("issues") or payload.get("workstream_issues")
+        if isinstance(raw_issues, list):
+            issues = raw_issues
+        else:
+            issues = [payload]
+    else:
+        raise ValueError("fixture must be a JSON object or list")
+
+    return build_workstream_context(
+        current_issue=current_issue,
+        issues=[issue for issue in issues if isinstance(issue, dict)],
+    )
 
 
 def load_case_codex_session(
@@ -608,11 +715,33 @@ def git_error_message(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stderr or result.stdout).strip() or f"git exited {result.returncode}"
 
 
+def target_head_commit(target_repo: Path) -> str:
+    result = run_target_git(target_repo, "rev-parse", "HEAD")
+    if result.returncode != 0:
+        raise TargetRepoPreparationError(
+            f"could not inspect target commit for {target_repo}: "
+            f"{git_error_message(result)}"
+        )
+    commit = result.stdout.strip()
+    if not commit:
+        raise TargetRepoPreparationError(
+            f"could not inspect target commit for {target_repo}: empty HEAD"
+        )
+    return commit
+
+
+def case_failure_summary(result: subprocess.CompletedProcess[str]) -> str:
+    if result.returncode == 0:
+        return "Case pipeline reported failure"
+    return f"Case command exited {result.returncode}"
+
+
 def write_case_task(
     *,
     issue: dict[str, Any],
     target_repo: Path,
     review_branch: str,
+    workstream_context: WorkstreamContext | None = None,
 ) -> tuple[Path, Path]:
     metadata = issue["metadata"]
     bead_id = str(issue["id"])
@@ -620,43 +749,47 @@ def write_case_task(
     task_dir.mkdir(parents=True, exist_ok=True)
     task_md = task_dir / f"{bead_id}.md"
     task_json = task_dir / f"{bead_id}.task.json"
+    validation_command = redact_sensitive_text(str(metadata["validation_command"]))
 
-    task_md.write_text(
-        "\n".join(
-            [
-                f"# {issue.get('title') or bead_id}",
-                "",
-                f"- Bead: {bead_id}",
-                f"- Target repo: {metadata['target_repo']}",
-                f"- Target base branch: {metadata['target_base_branch']}",
-                f"- Review branch: {review_branch}",
-                f"- Validation command: {metadata['validation_command']}",
-                "",
-                "## Bead Description",
-                "",
-                str(issue.get("description") or "").strip()
-                or "(No description provided.)",
-                "",
-                "## Evidence Expectations",
-                "",
-                (
-                    "Use test-output evidence for this task. Run "
-                    f"`{metadata['validation_command']}` and include the command "
-                    "output or a concise result summary in verifier evidence."
-                ),
-                (
-                    "Confirm the validation covers the changed paths, or note any "
-                    "changed paths that were not covered by the command."
-                ),
-                (
-                    "No screenshot or video evidence is required unless the bead "
-                    "description or implementation task explicitly asks for UI evidence."
-                ),
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    description = redact_sensitive_text(str(issue.get("description") or "").strip())
+    task_lines = [
+        f"# {redact_sensitive_text(str(issue.get('title') or bead_id))}",
+        "",
+        f"- Bead: {bead_id}",
+        f"- Target repo: {metadata['target_repo']}",
+        f"- Target base branch: {metadata['target_base_branch']}",
+        f"- Review branch: {review_branch}",
+        f"- Validation command: {validation_command}",
+        "",
+        "## Bead Description",
+        "",
+        description or "(No description provided.)",
+        "",
+    ]
+    if workstream_context is not None:
+        task_lines.extend(render_workstream_context_markdown(workstream_context))
+        task_lines.append("")
+    task_lines.extend(
+        [
+            "## Evidence Expectations",
+            "",
+            (
+                "Use test-output evidence for this task. Run "
+                f"`{validation_command}` and include the command "
+                "output or a concise result summary in verifier evidence."
+            ),
+            (
+                "Confirm the validation covers the changed paths, or note any "
+                "changed paths that were not covered by the command."
+            ),
+            (
+                "No screenshot or video evidence is required unless the bead "
+                "description or implementation task explicitly asks for UI evidence."
+            ),
+            "",
+        ]
     )
+    task_md.write_text("\n".join(task_lines), encoding="utf-8")
 
     task_json.write_text(
         json.dumps(
@@ -664,7 +797,7 @@ def write_case_task(
                 "agents": {},
                 "branch": review_branch,
                 "checkBaseline": None,
-                "checkCommand": metadata["validation_command"],
+                "checkCommand": validation_command,
                 "checkTarget": None,
                 "created": datetime.now(UTC).isoformat(),
                 "id": bead_id,
@@ -700,6 +833,7 @@ def write_case_projects_manifest(
     (case_data_dir / "home").mkdir(parents=True, exist_ok=True)
     (case_data_dir / "config-home").mkdir(parents=True, exist_ok=True)
     projects_path = case_data_dir / "projects.json"
+    validation_command = redact_sensitive_text(validation_command)
     manifest: dict[str, Any]
     if projects_path.is_file():
         try:
@@ -833,6 +967,7 @@ def write_execution_request(
     codex_session: CaseCodexSession | None = None,
 ) -> Path:
     metadata = issue["metadata"]
+    validation_command = redact_sensitive_text(str(metadata["validation_command"]))
     source_checkout = target_source_checkout or Path(
         str(metadata["target_repo_path"])
     ).resolve()
@@ -866,7 +1001,7 @@ def write_execution_request(
                 ),
                 "target_base_branch": metadata["target_base_branch"],
                 "review_branch": review_branch,
-                "validation_command": metadata["validation_command"],
+                "validation_command": validation_command,
                 "sandcastle_runtime_adapter": {
                     "status": "scaffolded",
                     "interface": "CaseAgentRuntime",

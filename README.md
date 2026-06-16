@@ -103,6 +103,48 @@ To pass a Case runtime adapter module through to native Case, pass:
 python3 -m automation_simple_workflow run --bead <bead-id> --case-runtime-module <path>
 ```
 
+To list AFK-runnable beads from a parent PRD/workstream without invoking Case:
+
+```sh
+python3 -m automation_simple_workflow select-workstream --parent <parent-bead-id>
+python3 -m automation_simple_workflow select-workstream --workstream-id <workstream-id> --json
+```
+
+For unattended runs, prefer an isolated target worktree so a dirty source
+checkout does not block the run:
+
+```sh
+python3 -m automation_simple_workflow run \
+  --bead <bead-id> \
+  --target-checkout-mode worktree
+```
+
+The direct checkout mode remains the default and still rejects uncommitted
+target repo changes.
+
+To project parent/sibling/dependency context into the generated Case task, pass
+a fixture or preloaded Beads JSON payload:
+
+```sh
+python3 -m automation_simple_workflow run \
+  --bead <bead-id> \
+  --workstream-context-json /path/to/workstream-context.json
+```
+
+To record run lifecycle state back to Beads, opt in explicitly:
+
+```sh
+python3 -m automation_simple_workflow run \
+  --bead <bead-id> \
+  --beads-lifecycle \
+  --close-bead-on-success
+```
+
+Lifecycle mode sets `active_run_*` metadata before Case starts, records
+`last_afk_run_*` result metadata after Case exits, comments failure evidence,
+clears active metadata, and can close the bead on success. Beads credentials are
+kept in the `bd` subprocess environment and are removed before invoking Case.
+
 To prepare native Case's default Pi transport to use a local Codex ChatGPT
 session token, pass:
 
@@ -288,7 +330,7 @@ temporary target repo, and should finish without live Codex/Pi credentials.
 
 ## Current Flow
 
-1. Load one bead by id.
+1. Load one bead by id, or use `select-workstream` to list runnable work first.
 2. Validate the current runnable Agent Task contract:
    `afk_enabled`, `afk_runner`, `target_repo`, `target_repo_path`,
    `target_base_branch`, `branch_policy`, `validation_command`, open status,
@@ -297,14 +339,19 @@ temporary target repo, and should finish without live Codex/Pi credentials.
 3. Derive the review branch from metadata:
    `agent/<bead-id>` for `independent`, or `agent/<workstream_id>` for
    `shared-sequential`.
-4. Write normal repo-local Case task files:
-   `<target_repo_path>/.case/tasks/active/<bead-id>.md`
-   and `<bead-id>.task.json`.
-5. Write Case project state under the wrapper state dir:
+4. Prepare the target checkout. Direct mode resets the target checkout to the
+   review branch and rejects dirty worktrees. Worktree mode creates or reuses an
+   isolated clean checkout under `.automation-simple/target-worktrees/`.
+5. Write normal repo-local Case task files under the selected checkout:
+   `.case/tasks/active/<bead-id>.md` and `<bead-id>.task.json`. If workstream
+   context is provided, the markdown includes parent summary, dependency chain,
+   sibling readiness, likely files, validation commands, and environment gates.
+6. Write Case project state under the wrapper state dir:
    `.automation-simple/case-data/projects.json`.
-6. Write a run request under:
+7. Write a run request under:
    `.automation-simple/runs/<run-id>/execution-request.json`.
-7. Invoke native Case through:
+8. If lifecycle mode is enabled, write `active_run_*` metadata to Beads.
+9. Invoke native Case through:
 
 ```sh
 bun src/index.ts run --task <task-json> --mode unattended
@@ -330,6 +377,9 @@ Case's native `--dry-run` flag. If native Case mutates the generated task JSON
 during dry-run, the wrapper archives that native copy in the run directory as
 `native-dry-run-task.json` and restores the generated task JSON in the target
 repo.
+After Case exits, lifecycle mode records success or failure metadata, comments
+actionable failure evidence, clears active metadata, and can close the bead on
+success when `--close-bead-on-success` is set.
 
 ## Cron Shape
 
@@ -449,8 +499,9 @@ per-phase adapter.
   patch process in `patches/workos-case/`.
 - Confirm Case can create/use the intended review branch for both branch
   policies.
-- Map Case final status, PR URL, PR number, and comments back to Beads metadata.
+- Map Case PR URL, PR number, and richer review comments back to Beads metadata.
 - Revisit a real Sandcastle-backed Case run only if per-phase sandbox isolation
   is worth the extra adapter complexity.
-- Add host-side locking or Beads `active_run_id` mutation around cron execution.
-- Add task selection for `ready-for-agent` beads instead of only `--bead`.
+- Add a dependency-ordered workstream runner that combines `select-workstream`,
+  worktree mode, lifecycle writes, and light verification instead of requiring
+  one `run --bead` invocation at a time.
