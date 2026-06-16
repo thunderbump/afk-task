@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .worktree import WorktreeProvisioningError, provision_target_worktree
+
 
 REQUIRED_METADATA = [
     "afk_enabled",
@@ -58,6 +60,19 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--case-command", default="bun")
     run.add_argument("--case-dry-run", action="store_true")
     run.add_argument("--case-runtime-module")
+    run.add_argument(
+        "--target-checkout-mode",
+        choices=("direct", "worktree"),
+        default="direct",
+        help="Use the target checkout directly or provision an isolated worktree.",
+    )
+    run.add_argument(
+        "--target-worktree-root",
+        help=(
+            "Directory for provisioned target worktrees. Defaults to "
+            "<state-dir>/target-worktrees."
+        ),
+    )
     run.add_argument("--case-codex-session", action="store_true")
     run.add_argument(
         "--codex-auth-file",
@@ -68,6 +83,18 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--bd-command", default="bd")
     run.add_argument("--beads-workspace", default="/home/bump/Projects/beads")
     run.add_argument(
+        "--beads-password-file",
+        default="/home/bump/Projects/beads/secrets/dolt_beads_password.txt",
+    )
+
+    select = subparsers.add_parser("select-workstream")
+    select_scope = select.add_mutually_exclusive_group(required=True)
+    select_scope.add_argument("--parent")
+    select_scope.add_argument("--workstream-id")
+    select.add_argument("--json", action="store_true")
+    select.add_argument("--bd-command", default="bd")
+    select.add_argument("--beads-workspace", default="/home/bump/Projects/beads")
+    select.add_argument(
         "--beads-password-file",
         default="/home/bump/Projects/beads/secrets/dolt_beads_password.txt",
     )
@@ -85,10 +112,23 @@ def main(argv: list[str] | None = None) -> int:
             case_runtime_module=(
                 Path(args.case_runtime_module) if args.case_runtime_module else None
             ),
+            target_checkout_mode=args.target_checkout_mode,
+            target_worktree_root=(
+                Path(args.target_worktree_root) if args.target_worktree_root else None
+            ),
             case_codex_session=args.case_codex_session,
             codex_auth_file=Path(args.codex_auth_file),
             codex_model=args.codex_model,
             case_codex_scout_only=args.case_codex_scout_only,
+            bd_command=args.bd_command,
+            beads_workspace=Path(args.beads_workspace),
+            beads_password_file=Path(args.beads_password_file),
+        )
+    if args.command == "select-workstream":
+        return select_workstream(
+            parent_id=args.parent,
+            workstream_id=args.workstream_id,
+            json_output=args.json,
             bd_command=args.bd_command,
             beads_workspace=Path(args.beads_workspace),
             beads_password_file=Path(args.beads_password_file),
@@ -114,6 +154,8 @@ def run_bead(
     case_command: str,
     case_dry_run: bool,
     case_runtime_module: Path | None,
+    target_checkout_mode: str,
+    target_worktree_root: Path | None,
     case_codex_session: bool,
     codex_auth_file: Path,
     codex_model: str,
@@ -127,6 +169,8 @@ def run_bead(
         case_data_dir = case_data_dir.resolve()
     if case_runtime_module is not None:
         case_runtime_module = case_runtime_module.resolve()
+    if target_worktree_root is not None:
+        target_worktree_root = target_worktree_root.resolve()
     codex_auth_file = codex_auth_file.resolve()
     issue = load_issue(
         bead_id=bead_id,
@@ -169,16 +213,30 @@ def run_bead(
         return 1
 
     metadata = issue["metadata"]
-    target_repo = Path(str(metadata["target_repo_path"])).resolve()
+    target_source_checkout = Path(str(metadata["target_repo_path"])).resolve()
+    target_repo = target_source_checkout
+    target_worktree_checkout = None
     case_data = case_data_dir or state_dir / "case-data"
     review_branch = review_branch_for(bead_id=bead_id, metadata=metadata)
     try:
-        prepare_target_review_branch(
-            target_repo=target_repo,
-            base_branch=str(metadata["target_base_branch"]),
-            review_branch=review_branch,
-        )
-    except TargetRepoPreparationError as error:
+        if target_checkout_mode == "worktree":
+            provisioned = provision_target_worktree(
+                source_checkout=target_source_checkout,
+                worktree_root=target_worktree_root
+                or state_dir / "target-worktrees",
+                base_branch=str(metadata["target_base_branch"]),
+                review_branch=review_branch,
+            )
+            target_source_checkout = provisioned.source_checkout
+            target_repo = provisioned.worktree_checkout
+            target_worktree_checkout = provisioned.worktree_checkout
+        else:
+            prepare_target_review_branch(
+                target_repo=target_repo,
+                base_branch=str(metadata["target_base_branch"]),
+                review_branch=review_branch,
+            )
+    except (TargetRepoPreparationError, WorktreeProvisioningError) as error:
         print(f"run-bead target repo invalid: {error}", file=sys.stderr)
         return 1
     task_md, task_json = write_case_task(
@@ -210,6 +268,10 @@ def run_bead(
         review_branch=review_branch,
         case_dry_run=case_dry_run,
         case_runtime_module=case_runtime_module,
+        target_checkout_mode=target_checkout_mode,
+        target_checkout_path=target_repo,
+        target_source_checkout=target_source_checkout,
+        target_worktree_checkout=target_worktree_checkout,
         codex_session=codex_session,
     )
     generated_task_json = task_json.read_text(encoding="utf-8") if case_dry_run else None
@@ -249,6 +311,55 @@ def run_bead(
     print(f"run-bead handed off: {bead_id}")
     print(f"Case task JSON: {task_json}")
     print(f"Execution request: {request_path}")
+    return 0
+
+
+def select_workstream(
+    *,
+    parent_id: str | None,
+    workstream_id: str | None,
+    json_output: bool,
+    bd_command: str,
+    beads_workspace: Path,
+    beads_password_file: Path,
+) -> int:
+    from .workstream_selection import (
+        WorkstreamSelectionError,
+        load_parent_workstream_issues,
+        load_workstream_issues,
+        select_runnable_workstream_beads,
+    )
+
+    try:
+        if parent_id is not None:
+            issues = load_parent_workstream_issues(
+                parent_id=parent_id,
+                bd_command=bd_command,
+                beads_workspace=beads_workspace,
+                beads_password_file=beads_password_file,
+            )
+        else:
+            assert workstream_id is not None
+            issues = load_workstream_issues(
+                workstream_id=workstream_id,
+                bd_command=bd_command,
+                beads_workspace=beads_workspace,
+                beads_password_file=beads_password_file,
+            )
+        selected = select_runnable_workstream_beads(
+            issues,
+            parent_id=parent_id,
+            workstream_id=workstream_id,
+        )
+    except WorkstreamSelectionError as error:
+        print(f"select-workstream failed: {error}", file=sys.stderr)
+        return 1
+
+    if json_output:
+        print(json.dumps(selected, indent=2))
+    else:
+        for issue in selected:
+            print(issue["id"])
     return 0
 
 
@@ -715,9 +826,17 @@ def write_execution_request(
     review_branch: str,
     case_dry_run: bool,
     case_runtime_module: Path | None,
+    target_checkout_mode: str = "direct",
+    target_checkout_path: Path | None = None,
+    target_source_checkout: Path | None = None,
+    target_worktree_checkout: Path | None = None,
     codex_session: CaseCodexSession | None = None,
 ) -> Path:
     metadata = issue["metadata"]
+    source_checkout = target_source_checkout or Path(
+        str(metadata["target_repo_path"])
+    ).resolve()
+    checkout_path = target_checkout_path or source_checkout
     run_dir = state_dir / "runs" / make_run_id(str(issue["id"]))
     run_dir.mkdir(parents=True, exist_ok=True)
     request_path = run_dir / "execution-request.json"
@@ -735,8 +854,16 @@ def write_execution_request(
                 "case_codex_session": case_codex_session_metadata(codex_session),
                 "case_task_json": str(task_json),
                 "case_task_markdown": str(task_md),
+                "target_checkout_mode": target_checkout_mode,
+                "target_checkout_path": str(checkout_path),
                 "target_repo": metadata["target_repo"],
                 "target_repo_path": metadata["target_repo_path"],
+                "target_source_checkout": str(source_checkout),
+                "target_worktree_checkout": (
+                    str(target_worktree_checkout)
+                    if target_worktree_checkout is not None
+                    else None
+                ),
                 "target_base_branch": metadata["target_base_branch"],
                 "review_branch": review_branch,
                 "validation_command": metadata["validation_command"],
