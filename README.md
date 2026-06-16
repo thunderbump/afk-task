@@ -110,6 +110,30 @@ python3 -m automation_simple_workflow select-workstream --parent <parent-bead-id
 python3 -m automation_simple_workflow select-workstream --workstream-id <workstream-id> --json
 ```
 
+To run a dependency-ordered workstream batch, use `run-workstream`:
+
+```sh
+python3 -m automation_simple_workflow run-workstream --parent <parent-bead-id>
+python3 -m automation_simple_workflow run-workstream --workstream-id <workstream-id>
+```
+
+`run-workstream` defaults to isolated target worktrees, projects workstream
+context into each child task, reuses the shared review branch for
+`shared-sequential` beads, runs metadata `light_verification_command` after each
+successful child, and runs metadata `validation_command` once after the batch
+finishes. It stops before Case on configured `human_gates`,
+`environment_gates`, `stop_conditions`, or `gates`, and stops on Case, light
+verification, final validation, or dependency-blockage failures.
+
+For fixture-driven tests or dry runs, pass preloaded workstream records:
+
+```sh
+python3 -m automation_simple_workflow run-workstream \
+  --parent <parent-bead-id> \
+  --workstream-json /path/to/workstream.json \
+  --case-checkout /path/to/workos-case
+```
+
 For unattended runs, prefer an isolated target worktree so a dirty source
 checkout does not block the run:
 

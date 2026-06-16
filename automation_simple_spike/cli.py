@@ -116,6 +116,62 @@ def main(argv: list[str] | None = None) -> int:
         default="/home/bump/Projects/beads/secrets/dolt_beads_password.txt",
     )
 
+    run_workstream_parser = subparsers.add_parser("run-workstream")
+    run_workstream_scope = run_workstream_parser.add_mutually_exclusive_group(
+        required=True
+    )
+    run_workstream_scope.add_argument("--parent")
+    run_workstream_scope.add_argument("--workstream-id")
+    run_workstream_parser.add_argument(
+        "--workstream-json",
+        help="Optional fixture JSON with parent/workstream issue records.",
+    )
+    run_workstream_parser.add_argument("--state-dir", default=".automation-simple")
+    run_workstream_parser.add_argument(
+        "--case-checkout",
+        help="Path to the patched workos/case checkout. Defaults to CASE_CHECKOUT.",
+    )
+    run_workstream_parser.add_argument("--case-data-dir")
+    run_workstream_parser.add_argument("--case-command", default="bun")
+    run_workstream_parser.add_argument("--case-dry-run", action="store_true")
+    run_workstream_parser.add_argument("--case-runtime-module")
+    run_workstream_parser.add_argument(
+        "--target-checkout-mode",
+        choices=("direct", "worktree"),
+        default="worktree",
+        help="Use the target checkout directly or provision an isolated worktree.",
+    )
+    run_workstream_parser.add_argument(
+        "--target-worktree-root",
+        help=(
+            "Directory for provisioned target worktrees. Defaults to "
+            "<state-dir>/target-worktrees."
+        ),
+    )
+    run_workstream_parser.add_argument("--case-codex-session", action="store_true")
+    run_workstream_parser.add_argument(
+        "--codex-auth-file",
+        default=str(Path.home() / ".codex" / "auth.json"),
+    )
+    run_workstream_parser.add_argument("--codex-model", default="gpt-5.5")
+    run_workstream_parser.add_argument("--case-codex-scout-only", action="store_true")
+    run_workstream_parser.add_argument("--bd-command", default="bd")
+    run_workstream_parser.add_argument(
+        "--beads-workspace",
+        default="/home/bump/Projects/beads",
+    )
+    run_workstream_parser.add_argument(
+        "--beads-password-file",
+        default="/home/bump/Projects/beads/secrets/dolt_beads_password.txt",
+    )
+    run_workstream_parser.add_argument("--beads-lifecycle", action="store_true")
+    run_workstream_parser.add_argument("--close-bead-on-success", action="store_true")
+    run_workstream_parser.add_argument(
+        "--skip-final-validation",
+        action="store_true",
+        help="Run child beads and light checks only; do not run final validation.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "run":
         return run_bead(
@@ -157,6 +213,40 @@ def main(argv: list[str] | None = None) -> int:
             beads_workspace=Path(args.beads_workspace),
             beads_password_file=Path(args.beads_password_file),
         )
+    if args.command == "run-workstream":
+        from .workstream_runner import run_workstream_command
+
+        return run_workstream_command(
+            parent_id=args.parent,
+            workstream_id=args.workstream_id,
+            workstream_json=(
+                Path(args.workstream_json) if args.workstream_json else None
+            ),
+            state_dir=Path(args.state_dir),
+            case_checkout=configured_case_checkout(args.case_checkout),
+            case_data_dir=Path(args.case_data_dir) if args.case_data_dir else None,
+            case_command=args.case_command,
+            case_dry_run=args.case_dry_run,
+            case_runtime_module=(
+                Path(args.case_runtime_module) if args.case_runtime_module else None
+            ),
+            target_checkout_mode=args.target_checkout_mode,
+            target_worktree_root=(
+                Path(args.target_worktree_root)
+                if args.target_worktree_root
+                else None
+            ),
+            case_codex_session=args.case_codex_session,
+            codex_auth_file=Path(args.codex_auth_file),
+            codex_model=args.codex_model,
+            case_codex_scout_only=args.case_codex_scout_only,
+            bd_command=args.bd_command,
+            beads_workspace=Path(args.beads_workspace),
+            beads_password_file=Path(args.beads_password_file),
+            beads_lifecycle=args.beads_lifecycle,
+            close_bead_on_success=args.close_bead_on_success,
+            skip_final_validation=args.skip_final_validation,
+        )
     parser.error(f"unknown command: {args.command}")
     return 2
 
@@ -190,6 +280,7 @@ def run_bead(
     beads_password_file: Path,
     beads_lifecycle: bool,
     close_bead_on_success: bool,
+    skip_target_preparation: bool = False,
 ) -> int:
     if close_bead_on_success and not beads_lifecycle:
         print(
@@ -271,7 +362,13 @@ def run_bead(
     case_data = case_data_dir or state_dir / "case-data"
     review_branch = review_branch_for(bead_id=bead_id, metadata=metadata)
     try:
-        if target_checkout_mode == "worktree":
+        if skip_target_preparation:
+            git_dir = run_target_git(target_repo, "rev-parse", "--git-dir")
+            if git_dir.returncode != 0:
+                raise TargetRepoPreparationError(
+                    f"{target_repo} is not a git repository"
+                )
+        elif target_checkout_mode == "worktree":
             provisioned = provision_target_worktree(
                 source_checkout=target_source_checkout,
                 worktree_root=target_worktree_root
