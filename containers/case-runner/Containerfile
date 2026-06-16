@@ -1,0 +1,11 @@
+FROM docker.io/library/node:22-bookworm
+
+ARG BUN_VERSION=1.3.14
+RUN npm install --global "bun@${BUN_VERSION}"
+
+WORKDIR /workspace
+
+COPY containers/case-runner/entrypoint.sh /usr/local/bin/automation-workflow-entrypoint
+RUN chmod +x /usr/local/bin/automation-workflow-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/automation-workflow-entrypoint"]

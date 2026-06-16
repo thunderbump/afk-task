@@ -65,10 +65,25 @@ if [ ! -e "$1" ]; then
   exit 2
 fi
 
+applied_patch_ids="$(git -C "$case_checkout" log -p --reverse --format=email | git patch-id --stable 2>/dev/null | awk '{print $1}' || true)"
+
 for patch in "$@"; do
-  if git -C "$case_checkout" apply --reverse --check "$patch" >/dev/null 2>&1; then
+  patch_id="$(git patch-id --stable < "$patch" 2>/dev/null | awk 'NR == 1 {print $1}' || true)"
+  subject="$(
+    sed -n 's/^Subject: //p' "$patch" |
+      sed -n '1{s/^\[[^]]*\] //; p;}'
+  )"
+  if [ -n "$patch_id" ] && printf "%s\n" "$applied_patch_ids" | grep -F -x -- "$patch_id" >/dev/null 2>&1; then
+    echo "already applied: $(basename -- "$patch")"
+  elif [ -n "$subject" ] && git -C "$case_checkout" log --format=%s | grep -F -x -- "$subject" >/dev/null 2>&1; then
+    echo "already applied by subject: $(basename -- "$patch")"
+  elif git -C "$case_checkout" apply --reverse --check "$patch" >/dev/null 2>&1; then
     echo "already applied: $(basename -- "$patch")"
   else
     git -C "$case_checkout" am "$patch"
+    if [ -n "$patch_id" ]; then
+      applied_patch_ids="${applied_patch_ids}
+${patch_id}"
+    fi
   fi
 done

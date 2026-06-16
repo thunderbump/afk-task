@@ -17,16 +17,17 @@ coordinator shrink by leaning on normal Case and Sandcastle boundaries.
 - Case is the workflow engine. This repo generates normal Case task and project
   state, then invokes an external patched `workos/case` checkout to run the
   unattended pipeline.
-- Sandcastle is the sandbox runtime direction. The checked-in scaffold shows how
-  a Case `CaseAgentRuntime` adapter can call Sandcastle for each phase; the raw
-  Sandcastle repo and its dependencies are not vendored here.
+- The current runtime direction is to containerize the whole Case run so Case
+  keeps ownership of inference, phase orchestration, review, and close. The
+  checked-in Sandcastle scaffold remains an exploratory per-phase sandbox option;
+  the raw Sandcastle repo and its dependencies are not vendored here.
 - Codex/Pi adapter state is generated locally only when
   `--case-codex-session` is enabled. The wrapper writes non-secret model
   selection under `.automation-simple/` and passes the access token only to the
   child Case process.
 - The stitch point is intentionally small: Beads chooses the work, this wrapper
-  writes Case-compatible state, Case owns the workflow, and the Sandcastle
-  adapter is the planned runtime boundary for sandboxed agent execution.
+  writes Case-compatible state, and Case owns the workflow inside the selected
+  runner boundary.
 
 ## Setup
 
@@ -174,6 +175,59 @@ written into wrapper state, task files, logs, or Case environment.
 
 For tests and smoke runs, pass `--bead-json <path>` or fake `--bd-command`.
 
+## Containerized Runner
+
+The simplest isolation path is to run the whole workflow inside a container and
+let Case keep its normal Pi/Codex inference path. This avoids making Sandcastle
+and Case both own agent spawning for every phase.
+
+Build and run the local runner image with a fixture bead:
+
+```sh
+scripts/run-containerized-workflow.sh --build --mount /path/to/target-repo --mount /path/to/fixture-dir -- \
+  run \
+  --bead <bead-id> \
+  --bead-json /path/to/fixture-dir/bead.json \
+  --case-checkout "$(pwd)/.external/workos-case"
+```
+
+The script mounts this workflow checkout at the same absolute path inside the
+container. Use `--mount /path/to/target-repo` for any target repo or fixture path
+referenced by the bead metadata. By default the container entrypoint prepares
+`.external/workos-case` if it is missing. Pass `--setup-case` to refresh that
+checkout on every run, or `--skip-case-setup` for fake-Case smoke tests. Use
+`--mount-ro /path/to/secret-dir` for read-only credential mounts. On SELinux
+hosts that require relabeling, use `--volume-suffix :Z` or `--volume-suffix :z`
+for writable mounts and `--ro-volume-suffix :ro,Z` or `--ro-volume-suffix :ro,z`
+for read-only mounts.
+
+The container image does not currently install or configure `bd`, so central
+Beads runs need either a fixture JSON via `--bead-json` or a later explicit
+Beads workspace/CLI mount. Live Codex-session runs likewise need an explicit
+read-only auth mount plus `--case-codex-session --codex-auth-file <mounted-path>`.
+
+For a no-network synthetic proof, mount a temp directory containing the target
+repo, bead JSON, fake Case command, and fake Case checkout directory:
+
+```sh
+scripts/run-containerized-workflow.sh --build --skip-case-setup --mount "$tmp" -- \
+  run \
+  --bead central-smoke.1 \
+  --bead-json "$tmp/bead.json" \
+  --state-dir "$tmp/.automation-simple" \
+  --case-checkout "$tmp/workos-case" \
+  --case-command "$tmp/fake-case"
+```
+
+This proves the container boundary and workflow handoff without Beads secrets,
+Codex/Pi credentials, GitHub credentials, or a live Case process.
+
+The same synthetic path is available as:
+
+```sh
+scripts/container-smoke.sh
+```
+
 ## Fresh Clone Smoke
 
 After cloning this repo and preparing Case, run the local validation commands:
@@ -298,7 +352,9 @@ and later Case handoff. This workflow removes most of that coordinator surface:
 - Beads remains the source of task readiness and policy metadata.
 - Case receives a native task file and owns scout, implement, verify, review,
   close, retrospective, event logs, and PR fields.
-- Sandcastle becomes a Case runtime adapter, not a separate coordinator backend.
+- The container runner can become the first sandbox boundary for the whole Case
+  run. Sandcastle remains available for a later per-phase adapter if the extra
+  isolation is worth the additional ownership overlap.
 - Local state is limited to generated Case config plus a small execution request
   proving what was handed off.
 
@@ -324,7 +380,10 @@ interface CaseAgentRuntime {
 ```
 
 Case currently defaults to `PiRuntimeAdapter`. A Sandcastle adapter can satisfy
-the same interface and call Sandcastle from each Case phase.
+the same interface and call Sandcastle from each Case phase, but that makes both
+Case and Sandcastle participate in agent spawning and inference ownership. The
+containerized runner avoids that overlap by moving the boundary outside the
+whole Case process.
 
 The local Case patches add `run --runtime-module <path>`, which dynamically
 imports a module exporting `createCaseRuntime()`, a default runtime factory, or
@@ -350,10 +409,12 @@ await run({
 });
 ```
 
-The existing automation repo already uses this shape successfully. The narrow
-plug-in point is therefore a Case runtime adapter that converts each
-`SpawnAgentOptions` prompt into one Sandcastle `run()` invocation and parses the
-agent stdout back into Case's `SpawnAgentResult`.
+The existing automation repo already uses this shape successfully. If per-phase
+isolation becomes necessary, the narrow plug-in point is a Case runtime adapter
+that converts each `SpawnAgentOptions` prompt into one Sandcastle `run()`
+invocation and parses the agent stdout back into Case's `SpawnAgentResult`.
+That path remains more complex than containerizing the whole Case run because it
+splits inference ownership across two abstractions.
 
 See `scaffolds/case-sandcastle-runtime-adapter.ts` for the intended seam.
 
@@ -376,18 +437,20 @@ scripts/smoke.sh
 
 This should influence the next automation design, but it should not replace
 `/home/bump/Projects/automation` yet. The bead intake and Case handoff are much
-smaller than the current coordinator, but replacement depends on proving a real
-Case `CaseAgentRuntime` backed by Sandcastle and confirming Case can safely own
-branch, validation, PR, and comment creation for these Beads-driven tasks.
+smaller than the current coordinator, and the next runtime proof should focus on
+the containerized whole-Case runner before investing further in a Sandcastle
+per-phase adapter.
 
 ## Remaining Gaps
 
-- Implement and compile the real Case `SandcastleRuntimeAdapter`.
+- Prove the containerized whole-Case runner with native Case dry-run and then a
+  real dashboard bead.
 - Decide whether to upstream Case `--runtime-module` or keep carrying the local
   patch process in `patches/workos-case/`.
 - Confirm Case can create/use the intended review branch for both branch
   policies.
 - Map Case final status, PR URL, PR number, and comments back to Beads metadata.
+- Revisit a real Sandcastle-backed Case run only if per-phase sandbox isolation
+  is worth the extra adapter complexity.
 - Add host-side locking or Beads `active_run_id` mutation around cron execution.
 - Add task selection for `ready-for-agent` beads instead of only `--bead`.
-- Run a real Sandcastle-backed Case run.

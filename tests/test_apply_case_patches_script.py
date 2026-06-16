@@ -72,6 +72,14 @@ class ApplyCasePatchesScriptTest(unittest.TestCase):
     def test_apply_case_patches_is_idempotent(self) -> None:
         with TemporaryDirectory() as tmp:
             case_repo, patch_dir = self.init_patch_fixture(Path(tmp))
+            patch_file = patch_dir / "0001-update-case-fixture.patch"
+            patch_file.write_text(
+                patch_file.read_text(encoding="utf-8").replace(
+                    "Subject: [PATCH] Update Case fixture",
+                    "Subject: [PATCH 1/2] Update Case fixture",
+                ),
+                encoding="utf-8",
+            )
 
             first = subprocess.run(
                 [
@@ -89,6 +97,13 @@ class ApplyCasePatchesScriptTest(unittest.TestCase):
             )
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertEqual((case_repo / "case.txt").read_text(), "after\n")
+            patch_file.write_text(
+                patch_file.read_text(encoding="utf-8").replace(
+                    "before",
+                    "context-that-no-longer-matches",
+                ),
+                encoding="utf-8",
+            )
 
             second = subprocess.run(
                 [
@@ -105,7 +120,10 @@ class ApplyCasePatchesScriptTest(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-            self.assertIn("already applied: 0001-update-case-fixture.patch", second.stdout)
+            self.assertIn(
+                "already applied by subject: 0001-update-case-fixture.patch",
+                second.stdout,
+            )
 
     def test_setup_case_checkout_clones_and_prepares_checkout(self) -> None:
         with TemporaryDirectory() as tmp:
