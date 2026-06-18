@@ -507,6 +507,21 @@ class RunBeadCliTest(unittest.TestCase):
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
+            home_dir = tmp_path / "home"
+            home_bun_dir = home_dir / ".bun" / "bin"
+            home_bun_dir.mkdir(parents=True)
+            home_bun = home_bun_dir / "bun"
+            home_bun.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "from pathlib import Path",
+                        "Path(__file__).with_suffix('.json').write_text('ran\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            home_bun.chmod(0o755)
             bead_json = tmp_path / "bead.json"
             self.write_eligible_bead(bead_json, target_repo, "central-run.13")
 
@@ -522,11 +537,15 @@ class RunBeadCliTest(unittest.TestCase):
                 str(case_checkout),
                 "--case-command",
                 "definitely-missing-case-command",
+                env={"HOME": str(home_dir), "PATH": os.defpath},
             )
 
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("run-bead missing Case command", result.stderr)
             self.assertIn("definitely-missing-case-command", result.stderr)
+            self.assertIn("--case-command /path/to/bun", result.stderr)
+            self.assertIn("add Bun to PATH", result.stderr)
+            self.assertFalse(home_bun.with_suffix(".json").exists())
             self.assertFalse((target_repo / ".case").exists())
             self.assertFalse(state_dir.exists())
 
@@ -873,6 +892,149 @@ class RunBeadCliTest(unittest.TestCase):
                     "status",
                     ".case/tasks/active/central-run.12.task.json",
                 ],
+            )
+
+    def test_default_case_command_uses_bun_from_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            fake_bun = fake_bin / "bun"
+            fake_bun.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "  'cwd': os.getcwd(),",
+                        "}) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_bun.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.15")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.15",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                env={"PATH": f"{fake_bin}{os.pathsep}{os.defpath}"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            fake_bun_record = json.loads(
+                fake_bun.with_suffix(".json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(fake_bun_record["cwd"], str(case_checkout))
+            self.assertEqual(
+                fake_bun_record["argv"],
+                [
+                    "src/index.ts",
+                    "run",
+                    "--task",
+                    str(
+                        target_repo
+                        / ".case"
+                        / "tasks"
+                        / "active"
+                        / "central-run.15.task.json"
+                    ),
+                    "--mode",
+                    "unattended",
+                ],
+            )
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            self.assertIn(
+                f"CASE_COMMAND={fake_bun}",
+                case_cli_shim.read_text(encoding="utf-8"),
+            )
+
+    def test_default_case_command_uses_home_bun_when_bun_is_outside_path(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            home_dir = tmp_path / "home"
+            home_bun_dir = home_dir / ".bun" / "bin"
+            home_bun_dir.mkdir(parents=True)
+            fake_bun = home_bun_dir / "bun"
+            fake_bun.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "  'cwd': os.getcwd(),",
+                        "}) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_bun.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.14")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.14",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                env={"HOME": str(home_dir), "PATH": os.defpath},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            fake_bun_record = json.loads(
+                fake_bun.with_suffix(".json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(fake_bun_record["cwd"], str(case_checkout))
+            self.assertEqual(
+                fake_bun_record["argv"],
+                [
+                    "src/index.ts",
+                    "run",
+                    "--task",
+                    str(
+                        target_repo
+                        / ".case"
+                        / "tasks"
+                        / "active"
+                        / "central-run.14.task.json"
+                    ),
+                    "--mode",
+                    "unattended",
+                ],
+            )
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            self.assertIn(
+                f"CASE_COMMAND={fake_bun}",
+                case_cli_shim.read_text(encoding="utf-8"),
             )
 
     def test_case_codex_session_writes_wrapper_config_and_injects_child_env_only(

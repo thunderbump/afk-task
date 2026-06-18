@@ -50,6 +50,7 @@ CASE_ENV_REMOVED_KEYS = (
     "PI_CODING_AGENT_DIR",
 )
 GITHUB_TOKEN_ENV_KEYS = ("GH_TOKEN", "GITHUB_TOKEN")
+DEFAULT_CASE_COMMAND = "bun"
 
 
 class TargetRepoPreparationError(ValueError):
@@ -91,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to the patched workos/case checkout. Defaults to CASE_CHECKOUT.",
     )
     run.add_argument("--case-data-dir")
-    run.add_argument("--case-command", default="bun")
+    run.add_argument("--case-command")
     run.add_argument("--case-dry-run", action="store_true")
     run.add_argument("--case-runtime-module")
     run.add_argument(
@@ -165,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to the patched workos/case checkout. Defaults to CASE_CHECKOUT.",
     )
     run_workstream_parser.add_argument("--case-data-dir")
-    run_workstream_parser.add_argument("--case-command", default="bun")
+    run_workstream_parser.add_argument("--case-command")
     run_workstream_parser.add_argument("--case-dry-run", action="store_true")
     run_workstream_parser.add_argument("--case-runtime-module")
     run_workstream_parser.add_argument(
@@ -307,7 +308,7 @@ def run_bead(
     state_dir: Path,
     case_checkout: Path | None,
     case_data_dir: Path | None,
-    case_command: str,
+    case_command: str | None,
     case_dry_run: bool,
     case_runtime_module: Path | None,
     target_checkout_mode: str,
@@ -398,8 +399,11 @@ def run_bead(
         return 1
     resolved_case_command = resolve_case_command(case_command)
     if resolved_case_command is None:
+        case_command_description = case_command or DEFAULT_CASE_COMMAND
         print(
-            f"run-bead missing Case command: {case_command} was not found",
+            "run-bead missing Case command: "
+            f"{case_command_description} was not found; pass "
+            "--case-command /path/to/bun or add Bun to PATH",
             file=sys.stderr,
         )
         return 1
@@ -1161,8 +1165,18 @@ def case_cli_shim_path(state_dir: Path) -> Path:
     return state_dir / "case-bin" / "ca"
 
 
-def resolve_case_command(case_command: str) -> str | None:
-    return shutil.which(os.path.expanduser(case_command))
+def resolve_case_command(case_command: str | None) -> str | None:
+    if case_command is not None:
+        return shutil.which(os.path.expanduser(case_command))
+
+    path_command = shutil.which(DEFAULT_CASE_COMMAND)
+    if path_command is not None:
+        return path_command
+
+    home_bun = Path.home() / ".bun" / "bin" / "bun"
+    if home_bun.is_file() and os.access(home_bun, os.X_OK):
+        return str(home_bun)
+    return None
 
 
 def github_pr_preflight_failure(
