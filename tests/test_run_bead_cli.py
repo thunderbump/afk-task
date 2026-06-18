@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -315,6 +317,187 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertEqual(execution_request["case_cli_shim"], str(case_cli_shim))
             self.assertNotIn("ambient-openai-key", json.dumps(execution_request))
             self.assertNotIn("must-not-reach-case", json.dumps(execution_request))
+
+    def test_worker_validation_metadata_emits_executable_case_check_command(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            target_commit = self.init_target_repo(target_repo)
+            relative_state_dir = (
+                Path(".automation-simple")
+                / f"worker validation {uuid4().hex}"
+            )
+            state_dir = REPO_ROOT / relative_state_dir
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd()}) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            worker_module = tmp_path / "fake_validation_worker.py"
+            worker_module.write_text(
+                "\n".join(
+                    [
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "request_path = Path(sys.argv[sys.argv.index('--request') + 1])",
+                        "payload = json.loads(request_path.read_text(encoding='utf-8'))",
+                        "Path(os.environ['FAKE_WORKER_RECORD']).write_text(json.dumps({",
+                        "    'argv': sys.argv[1:],",
+                        "    'cwd': os.getcwd(),",
+                        "    'request_path': str(request_path),",
+                        "    'payload': payload,",
+                        "}, sort_keys=True) + '\\n', encoding='utf-8')",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bead_json = tmp_path / "bead.json"
+            bead_json.write_text(
+                json.dumps(
+                    {
+                        "id": "central-run.worker",
+                        "title": "Run worker validation",
+                        "description": "Compile worker-backed validation.",
+                        "status": "open",
+                        "labels": ["project:automation", "ready-for-agent"],
+                        "metadata": {
+                            "afk_enabled": True,
+                            "afk_runner": "codex",
+                            "target_repo": "local/test",
+                            "target_repo_path": str(target_repo),
+                            "target_base_branch": "main",
+                            "branch_policy": "independent",
+                            "validation_mode": "worker",
+                            "validation_worker": {
+                                "worker_command": "python3 -m fake_validation_worker",
+                                "profile": "safe",
+                                "timeout_seconds": 900,
+                                "repo": "local/test",
+                                "ref": "refs/heads/main",
+                                "commit": target_commit,
+                                "evidence_dir": "artifacts/validation",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            record_path = tmp_path / "worker-record.json"
+
+            try:
+                result = run_cli(
+                    "run",
+                    "--bead",
+                    "central-run.worker",
+                    "--bead-json",
+                    str(bead_json),
+                    "--state-dir",
+                    str(relative_state_dir),
+                    "--case-checkout",
+                    str(case_checkout),
+                    "--case-command",
+                    str(fake_case),
+                )
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                request_path = (
+                    state_dir
+                    / "validation-requests"
+                    / "central-run.worker.json"
+                )
+                validation_request = json.loads(
+                    request_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(validation_request["mode"], "worker")
+                self.assertEqual(validation_request["profile"], "safe")
+                self.assertEqual(validation_request["timeout_seconds"], 900)
+                self.assertEqual(validation_request["repo"], "local/test")
+                self.assertEqual(validation_request["ref"], "refs/heads/main")
+                self.assertEqual(validation_request["commit"], target_commit)
+                self.assertEqual(
+                    validation_request["evidence_dir"], "artifacts/validation"
+                )
+                self.assertEqual(
+                    validation_request["review_branch"],
+                    "agent/central-run.worker",
+                )
+
+                expected_command = (
+                    "python3 -m fake_validation_worker --request "
+                    f"{shlex.quote(str(request_path))}"
+                )
+                task_json_path = (
+                    target_repo
+                    / ".case"
+                    / "tasks"
+                    / "active"
+                    / "central-run.worker.task.json"
+                )
+                task_md_path = (
+                    target_repo
+                    / ".case"
+                    / "tasks"
+                    / "active"
+                    / "central-run.worker.md"
+                )
+                task_json = json.loads(task_json_path.read_text(encoding="utf-8"))
+                self.assertEqual(task_json["checkCommand"], expected_command)
+                self.assertNotIn("validation_worker", task_json)
+                task_markdown = task_md_path.read_text(encoding="utf-8")
+                self.assertIn(f"- Validation command: {expected_command}", task_markdown)
+                self.assertIn(f"Run `{expected_command}`", task_markdown)
+
+                project_manifest = json.loads(
+                    (state_dir / "case-data" / "projects.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                commands = project_manifest["repos"][0]["commands"]
+                self.assertEqual(commands["test"], expected_command)
+                self.assertEqual(commands["check"], expected_command)
+
+                worker_result = subprocess.run(
+                    task_json["checkCommand"],
+                    cwd=target_repo,
+                    env={
+                        **os.environ,
+                        "PYTHONPATH": str(tmp_path),
+                        "FAKE_WORKER_RECORD": str(record_path),
+                    },
+                    shell=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+                self.assertEqual(
+                    worker_result.returncode,
+                    0,
+                    worker_result.stdout + worker_result.stderr,
+                )
+                worker_record = json.loads(record_path.read_text(encoding="utf-8"))
+                self.assertEqual(worker_record["cwd"], str(target_repo))
+                self.assertEqual(
+                    Path(worker_record["request_path"]).resolve(),
+                    request_path.resolve(),
+                )
+                self.assertEqual(worker_record["payload"], validation_request)
+            finally:
+                shutil.rmtree(state_dir, ignore_errors=True)
 
     def test_generated_task_marks_current_case_task_active_for_phase_agents(
         self,

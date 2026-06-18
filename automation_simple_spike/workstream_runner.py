@@ -14,6 +14,7 @@ from .cli import (
     review_branch_for,
     run_bead,
 )
+from .validation_metadata import WORKER_METADATA_KEYS, is_worker_validation_requested
 from .workstream_context import (
     ENVIRONMENT_GATE_METADATA_KEYS,
     LIKELY_FILE_METADATA_KEYS,
@@ -39,6 +40,7 @@ SAFE_METADATA_KEYS = {
     "validation_command",
     "light_verification_command",
     "workstream_id",
+    *WORKER_METADATA_KEYS,
     *LIKELY_FILE_METADATA_KEYS,
     *ENVIRONMENT_GATE_METADATA_KEYS,
 }
@@ -279,7 +281,10 @@ def run_workstream_issues(
             if uses_shared_sequential_branch(issue):
                 shared_checkout = target_checkout
             final_validation_cwd = target_checkout
-            final_validation_command = str(issue["metadata"]["validation_command"])
+            final_validation_command = validation_command_from_request(
+                request,
+                issue_for_run,
+            )
 
             light_result = run_light_verification(
                 issue=issue,
@@ -462,6 +467,21 @@ def target_checkout_from_request(
         if isinstance(checkout, str) and checkout:
             return Path(checkout)
     return Path(str(issue["metadata"]["target_repo_path"])).resolve()
+
+
+def validation_command_from_request(
+    request: Path | None,
+    issue: dict[str, Any],
+) -> str:
+    metadata = issue.get("metadata") or {}
+    if not is_worker_validation_requested(metadata):
+        return str(metadata["validation_command"])
+    if request is not None:
+        payload = json.loads(request.read_text(encoding="utf-8"))
+        command = payload.get("validation_command")
+        if isinstance(command, str) and command:
+            return command
+    return str(metadata["validation_command"])
 
 
 def mark_issue_closed(issues: list[dict[str, Any]], issue_id: str) -> None:

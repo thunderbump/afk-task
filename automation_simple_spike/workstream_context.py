@@ -4,6 +4,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from .validation_metadata import (
+    has_validation_metadata,
+    is_worker_validation_requested,
+    worker_validation_command,
+)
+
 
 REQUIRED_RUNNABLE_METADATA = {
     "afk_enabled",
@@ -12,7 +18,6 @@ REQUIRED_RUNNABLE_METADATA = {
     "target_repo_path",
     "target_base_branch",
     "branch_policy",
-    "validation_command",
 }
 
 LIKELY_FILE_METADATA_KEYS = (
@@ -185,6 +190,9 @@ def validation_command_lines(issue: dict[str, Any]) -> list[str]:
     validation_command = metadata.get("validation_command")
     if validation_command:
         lines.append(f"- Final: `{redact_sensitive_text(str(validation_command))}`")
+    elif is_worker_validation_requested(metadata):
+        worker_command = worker_validation_command(metadata) or "<missing worker_command>"
+        lines.append(f"- Final: worker `{redact_sensitive_text(worker_command)}`")
     lines.append("- Sanity: `git diff --check` before handing off changes.")
     return lines
 
@@ -360,6 +368,8 @@ def readiness_label(
     ]
     if missing:
         return f"not ready: missing metadata {', '.join(missing)}"
+    if not has_validation_metadata(metadata):
+        return "not ready: missing metadata validation_command"
     active_run_id = metadata.get("active_run_id")
     if active_run_id:
         return "not ready: active run"

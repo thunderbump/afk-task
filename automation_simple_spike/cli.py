@@ -23,6 +23,12 @@ from .workstream_context import (
     render_workstream_context_markdown,
 )
 from .beads_lifecycle import BeadsLifecycleClient, BeadsLifecycleError, LifecycleRun
+from .validation_metadata import (
+    has_validation_metadata,
+    is_worker_validation_requested,
+    worker_metadata_value,
+    worker_validation_command,
+)
 from .worktree import (
     WorktreeProvisioningError,
     provision_target_worktree,
@@ -37,7 +43,6 @@ REQUIRED_METADATA = [
     "target_repo_path",
     "target_base_branch",
     "branch_policy",
-    "validation_command",
 ]
 
 CODEX_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
@@ -505,6 +510,18 @@ def run_bead(
     except (TargetRepoPreparationError, WorktreeProvisioningError) as error:
         print(f"run-bead target repo invalid: {error}", file=sys.stderr)
         return 1
+    try:
+        validation_command = compile_validation_metadata(
+            issue=issue,
+            state_dir=state_dir,
+            review_branch=review_branch,
+            target_checkout_path=target_repo,
+            target_source_checkout=target_source_checkout,
+            target_worktree_checkout=target_worktree_checkout,
+        )
+    except ValueError as error:
+        print(f"run-bead validation metadata invalid: {error}", file=sys.stderr)
+        return 1
     task_md, task_json = write_case_task(
         issue=issue,
         target_repo=target_repo,
@@ -515,7 +532,7 @@ def run_bead(
         case_data_dir=case_data,
         repo_name=str(metadata["target_repo"]),
         repo_path=target_repo,
-        validation_command=str(metadata["validation_command"]),
+        validation_command=validation_command,
         codex_session=codex_session,
     )
     if codex_session is not None:
@@ -824,6 +841,11 @@ def eligibility_rejections(issue: dict[str, Any]) -> list[str]:
     for field in REQUIRED_METADATA:
         if field not in metadata or metadata[field] in ("", None):
             reasons.append(f"missing metadata {field}")
+    if is_worker_validation_requested(metadata):
+        if worker_validation_command(metadata) is None:
+            reasons.append("missing metadata worker_command")
+    elif not has_validation_metadata(metadata):
+        reasons.append("missing metadata validation_command")
 
     if "afk_enabled" in metadata and metadata.get("afk_enabled") is not True:
         reasons.append("invalid metadata afk_enabled: expected true")
@@ -860,6 +882,109 @@ def eligibility_rejections(issue: dict[str, Any]) -> list[str]:
         reasons.append(f"open blocking dependency {blocker}")
 
     return reasons
+
+
+def compile_validation_metadata(
+    *,
+    issue: dict[str, Any],
+    state_dir: Path,
+    review_branch: str,
+    target_checkout_path: Path,
+    target_source_checkout: Path,
+    target_worktree_checkout: Path | None,
+) -> str:
+    metadata = issue["metadata"]
+    if not is_worker_validation_requested(metadata):
+        return str(metadata["validation_command"])
+
+    command = worker_validation_command(metadata)
+    if command is None:
+        raise ValueError("worker validation requires worker_command")
+
+    request_path = write_validation_worker_request(
+        issue=issue,
+        state_dir=state_dir,
+        review_branch=review_branch,
+        target_checkout_path=target_checkout_path,
+        target_source_checkout=target_source_checkout,
+        target_worktree_checkout=target_worktree_checkout,
+    )
+    compiled = f"{command} --request {shlex.quote(str(request_path))}"
+    metadata["validation_command"] = compiled
+    return compiled
+
+
+def write_validation_worker_request(
+    *,
+    issue: dict[str, Any],
+    state_dir: Path,
+    review_branch: str,
+    target_checkout_path: Path,
+    target_source_checkout: Path,
+    target_worktree_checkout: Path | None,
+) -> Path:
+    metadata = issue["metadata"]
+    request_dir = state_dir.resolve() / "validation-requests"
+    request_dir.mkdir(parents=True, exist_ok=True)
+    request_path = request_dir / f"{issue['id']}.json"
+    payload = {
+        "bead_id": issue["id"],
+        "mode": worker_metadata_value(
+            metadata,
+            flat_keys="validation_mode",
+            worker_keys="mode",
+            default="worker",
+        )
+        or "worker",
+        "profile": worker_metadata_value(
+            metadata,
+            flat_keys="validation_profile",
+            worker_keys="profile",
+        ),
+        "timeout_seconds": worker_metadata_value(
+            metadata,
+            flat_keys="validation_timeout_seconds",
+            worker_keys="timeout_seconds",
+        ),
+        "repo": worker_metadata_value(
+            metadata,
+            flat_keys="validation_repo",
+            worker_keys="repo",
+            default=metadata["target_repo"],
+        )
+        or metadata["target_repo"],
+        "ref": worker_metadata_value(
+            metadata,
+            flat_keys="validation_ref",
+            worker_keys="ref",
+        ),
+        "commit": worker_metadata_value(
+            metadata,
+            flat_keys="validation_commit",
+            worker_keys="commit",
+        ),
+        "evidence_dir": worker_metadata_value(
+            metadata,
+            flat_keys="validation_evidence_dir",
+            worker_keys=("evidence_dir", "evidence_directory"),
+        ),
+        "target_repo": metadata["target_repo"],
+        "target_repo_path": metadata["target_repo_path"],
+        "target_base_branch": metadata["target_base_branch"],
+        "target_checkout_path": str(target_checkout_path),
+        "target_source_checkout": str(target_source_checkout),
+        "target_worktree_checkout": (
+            str(target_worktree_checkout)
+            if target_worktree_checkout is not None
+            else None
+        ),
+        "review_branch": review_branch,
+    }
+    request_path.write_text(
+        redact_sensitive_text(json.dumps(payload, indent=2, sort_keys=True)) + "\n",
+        encoding="utf-8",
+    )
+    return request_path
 
 
 def review_branch_for(*, bead_id: str, metadata: dict[str, Any]) -> str:
