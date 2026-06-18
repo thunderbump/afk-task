@@ -851,8 +851,10 @@ def write_case_task(
 ) -> tuple[Path, Path]:
     metadata = issue["metadata"]
     bead_id = str(issue["id"])
-    task_dir = target_repo / ".case" / "tasks" / "active"
+    case_dir = target_repo / ".case"
+    task_dir = case_dir / "tasks" / "active"
     task_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / "active").write_text(f"{bead_id}\n", encoding="utf-8")
     task_md = task_dir / f"{bead_id}.md"
     task_json = task_dir / f"{bead_id}.task.json"
     validation_command = redact_sensitive_text(str(metadata["validation_command"]))

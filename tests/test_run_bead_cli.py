@@ -316,6 +316,96 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertNotIn("ambient-openai-key", json.dumps(execution_request))
             self.assertNotIn("must-not-reach-case", json.dumps(execution_request))
 
+    def test_generated_task_marks_current_case_task_active_for_phase_agents(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "record_path = Path(os.environ['FAKE_CASE_RECORD'])",
+                        "command = sys.argv[2] if len(sys.argv) > 2 else None",
+                        "records = json.loads(record_path.read_text(encoding='utf-8')) if record_path.exists() else {}",
+                        "if command == 'run':",
+                        "    records['run'] = {'argv': sys.argv[1:], 'cwd': os.getcwd()}",
+                        "elif command in {'mark-tested', 'mark-reviewed'}:",
+                        "    active_path = Path.cwd() / '.case' / 'active'",
+                        "    if not active_path.is_file():",
+                        "        print('missing .case/active', file=sys.stderr)",
+                        "        sys.exit(33)",
+                        "    records[command] = {",
+                        "        'active': active_path.read_text(encoding='utf-8').strip(),",
+                        "        'argv': sys.argv[1:],",
+                        "        'cwd': os.getcwd(),",
+                        "    }",
+                        "else:",
+                        "    records.setdefault('other', []).append({'argv': sys.argv[1:], 'cwd': os.getcwd()})",
+                        "record_path.write_text(json.dumps(records, sort_keys=True) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            record_path = tmp_path / "case-record.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.13")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.13",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                env={"FAKE_CASE_RECORD": str(record_path)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            active_path = target_repo / ".case" / "active"
+            self.assertTrue(active_path.is_file())
+            self.assertEqual(active_path.read_text(encoding="utf-8"), "central-run.13\n")
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            for command in ("mark-tested", "mark-reviewed"):
+                with self.subTest(command=command):
+                    shim_result = subprocess.run(
+                        [str(case_cli_shim), command],
+                        cwd=target_repo,
+                        env={
+                            "PATH": f"{case_cli_shim.parent}{os.pathsep}{os.defpath}",
+                            "FAKE_CASE_RECORD": str(record_path),
+                        },
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        shim_result.returncode,
+                        0,
+                        shim_result.stdout + shim_result.stderr,
+                    )
+
+            case_record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(case_record["mark-tested"]["active"], "central-run.13")
+            self.assertEqual(case_record["mark-reviewed"]["active"], "central-run.13")
+            self.assertEqual(case_record["mark-tested"]["cwd"], str(target_repo))
+            self.assertEqual(case_record["mark-reviewed"]["cwd"], str(target_repo))
+
     def test_case_checkout_can_come_from_environment(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
