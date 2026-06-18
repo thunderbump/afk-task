@@ -57,6 +57,7 @@ def run_workstream_command(
     parent_id: str | None,
     workstream_id: str | None,
     workstream_json: Path | None,
+    workstream_seed_ref: str | None,
     state_dir: Path,
     case_checkout: Path | None,
     case_data_dir: Path | None,
@@ -93,6 +94,7 @@ def run_workstream_command(
         issues,
         parent_id=parent_id,
         workstream_id=workstream_id,
+        workstream_seed_ref=workstream_seed_ref,
         state_dir=state_dir,
         case_checkout=case_checkout,
         case_data_dir=case_data_dir,
@@ -154,6 +156,7 @@ def run_workstream_issues(
     *,
     parent_id: str | None,
     workstream_id: str | None,
+    workstream_seed_ref: str | None,
     state_dir: Path,
     case_checkout: Path | None,
     case_data_dir: Path | None,
@@ -197,6 +200,11 @@ def run_workstream_issues(
 
             issue = runnable[0]
             issue_id = str(issue["id"])
+            workstream_seed_ref_for_run = (
+                workstream_seed_ref
+                if shared_checkout is None and uses_shared_sequential_branch(issue)
+                else None
+            )
             issue_for_run = issue_with_shared_checkout(
                 issue,
                 shared_checkout=shared_checkout,
@@ -257,6 +265,7 @@ def run_workstream_issues(
                 beads_lifecycle=beads_lifecycle,
                 close_bead_on_success=close_bead_on_success,
                 skip_target_preparation=skip_target_preparation,
+                workstream_seed_ref=workstream_seed_ref_for_run,
             )
             if result != 0:
                 print(

@@ -126,6 +126,20 @@ finishes. It does not treat `human_gates`, `environment_gates`,
 appear as task context, but they do not block an otherwise runnable AFK bead or
 add approval evidence to `execution-request.json`.
 
+To continue a `shared-sequential` workstream from an existing branch, ref, or
+GitHub PR URL before that work has merged to the target base branch, seed only
+the first shared branch setup:
+
+```sh
+python3 -m automation_simple_workflow run-workstream \
+  --workstream-id <workstream-id> \
+  --workstream-seed-ref agent/<prior-branch>
+```
+
+The generated review branch is still `agent/<workstream_id>`. Execution request
+artifacts for the seeded setup record `workstream_seed_ref`,
+`workstream_seed_commit`, and the resulting `review_branch`.
+
 Model live or HITL work in Beads instead. Move that work to `ready-for-human`,
 leave/open a blocking dependency, or create a blocked follow-up bead with the
 same `project:<slug>` ownership label. Once the human-attended work is resolved,

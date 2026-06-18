@@ -23,7 +23,11 @@ from .workstream_context import (
     render_workstream_context_markdown,
 )
 from .beads_lifecycle import BeadsLifecycleClient, BeadsLifecycleError, LifecycleRun
-from .worktree import WorktreeProvisioningError, provision_target_worktree
+from .worktree import (
+    WorktreeProvisioningError,
+    provision_target_worktree,
+    resolve_start_ref,
+)
 
 
 REQUIRED_METADATA = [
@@ -148,6 +152,13 @@ def main(argv: list[str] | None = None) -> int:
         "--workstream-json",
         help="Optional fixture JSON with parent/workstream issue records.",
     )
+    run_workstream_parser.add_argument(
+        "--workstream-seed-ref",
+        help=(
+            "Existing branch, ref, commit, or GitHub PR URL used to seed "
+            "the first shared-sequential review branch."
+        ),
+    )
     run_workstream_parser.add_argument("--state-dir", default=".automation-simple")
     run_workstream_parser.add_argument(
         "--case-checkout",
@@ -251,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
             workstream_json=(
                 Path(args.workstream_json) if args.workstream_json else None
             ),
+            workstream_seed_ref=args.workstream_seed_ref,
             state_dir=Path(args.state_dir),
             case_checkout=configured_case_checkout(args.case_checkout),
             case_data_dir=Path(args.case_data_dir) if args.case_data_dir else None,
@@ -310,6 +322,7 @@ def run_bead(
     beads_lifecycle: bool,
     close_bead_on_success: bool,
     skip_target_preparation: bool = False,
+    workstream_seed_ref: str | None = None,
 ) -> int:
     if close_bead_on_success and not beads_lifecycle:
         print(
@@ -395,6 +408,7 @@ def run_bead(
     target_source_checkout = Path(str(metadata["target_repo_path"])).resolve()
     target_repo = target_source_checkout
     target_worktree_checkout = None
+    workstream_seed_commit = None
     case_data = case_data_dir or state_dir / "case-data"
     review_branch = review_branch_for(bead_id=bead_id, metadata=metadata)
     planned_case_cli_shim = case_cli_shim_path(state_dir)
@@ -467,16 +481,23 @@ def run_bead(
                 or state_dir / "target-worktrees",
                 base_branch=str(metadata["target_base_branch"]),
                 review_branch=review_branch,
+                start_ref=workstream_seed_ref,
             )
             target_source_checkout = provisioned.source_checkout
             target_repo = provisioned.worktree_checkout
             target_worktree_checkout = provisioned.worktree_checkout
+            workstream_seed_commit = (
+                provisioned.start_commit if workstream_seed_ref is not None else None
+            )
         else:
-            prepare_target_review_branch(
+            workstream_seed_commit = prepare_target_review_branch(
                 target_repo=target_repo,
                 base_branch=str(metadata["target_base_branch"]),
                 review_branch=review_branch,
+                start_ref=workstream_seed_ref,
             )
+            if workstream_seed_ref is None:
+                workstream_seed_commit = None
     except (TargetRepoPreparationError, WorktreeProvisioningError) as error:
         print(f"run-bead target repo invalid: {error}", file=sys.stderr)
         return 1
@@ -516,6 +537,8 @@ def run_bead(
         target_source_checkout=target_source_checkout,
         target_worktree_checkout=target_worktree_checkout,
         codex_session=codex_session,
+        workstream_seed_ref=workstream_seed_ref,
+        workstream_seed_commit=workstream_seed_commit,
     )
     lifecycle_run = None
     if lifecycle_client is not None:
@@ -847,7 +870,8 @@ def prepare_target_review_branch(
     target_repo: Path,
     base_branch: str,
     review_branch: str,
-) -> None:
+    start_ref: str | None = None,
+) -> str:
     git_dir = run_target_git(target_repo, "rev-parse", "--git-dir")
     if git_dir.returncode != 0:
         raise TargetRepoPreparationError(f"{target_repo} is not a git repository")
@@ -874,12 +898,42 @@ def prepare_target_review_branch(
             f"target base branch does not exist locally: {base_branch}"
         )
 
-    checkout = run_target_git(target_repo, "checkout", "-B", review_branch, base_branch)
+    if start_ref is None:
+        effective_start_ref = base_branch
+        start = run_target_git(
+            target_repo,
+            "rev-parse",
+            "--verify",
+            f"{effective_start_ref}^{{commit}}",
+        )
+        if start.returncode != 0:
+            raise TargetRepoPreparationError(
+                f"target base branch does not resolve to a commit: "
+                f"{effective_start_ref}"
+            )
+        start_commit = start.stdout.strip()
+    else:
+        resolved_start_ref = resolve_start_ref(
+            target_repo,
+            start_ref,
+            label="workstream seed ref",
+        )
+        effective_start_ref = resolved_start_ref.ref
+        start_commit = resolved_start_ref.commit
+
+    checkout = run_target_git(
+        target_repo,
+        "checkout",
+        "-B",
+        review_branch,
+        effective_start_ref,
+    )
     if checkout.returncode != 0:
         raise TargetRepoPreparationError(
-            f"could not reset review branch {review_branch} to {base_branch}: "
+            f"could not reset review branch {review_branch} to {effective_start_ref}: "
             f"{git_error_message(checkout)}"
         )
+    return start_commit
 
 
 def run_target_git(target_repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -1282,6 +1336,8 @@ def write_execution_request(
     target_source_checkout: Path | None = None,
     target_worktree_checkout: Path | None = None,
     codex_session: CaseCodexSession | None = None,
+    workstream_seed_ref: str | None = None,
+    workstream_seed_commit: str | None = None,
 ) -> Path:
     metadata = issue["metadata"]
     validation_command = redact_sensitive_text(str(metadata["validation_command"]))
@@ -1292,45 +1348,45 @@ def write_execution_request(
     run_dir = state_dir / "runs" / make_run_id(str(issue["id"]))
     run_dir.mkdir(parents=True, exist_ok=True)
     request_path = run_dir / "execution-request.json"
+    payload: dict[str, Any] = {
+        "bead_id": issue["id"],
+        "case_checkout": str(case_checkout),
+        "case_cli_shim": str(case_cli_shim),
+        "case_data_dir": str(case_data_dir),
+        "case_dry_run": case_dry_run,
+        "case_runtime_module": (
+            str(case_runtime_module) if case_runtime_module is not None else None
+        ),
+        "case_codex_session": case_codex_session_metadata(codex_session),
+        "case_task_json": str(task_json),
+        "case_task_markdown": str(task_md),
+        "target_checkout_mode": target_checkout_mode,
+        "target_checkout_path": str(checkout_path),
+        "target_repo": metadata["target_repo"],
+        "target_repo_path": metadata["target_repo_path"],
+        "target_source_checkout": str(source_checkout),
+        "target_worktree_checkout": (
+            str(target_worktree_checkout)
+            if target_worktree_checkout is not None
+            else None
+        ),
+        "target_base_branch": metadata["target_base_branch"],
+        "review_branch": review_branch,
+        "validation_command": validation_command,
+        "sandcastle_runtime_adapter": {
+            "status": "scaffolded",
+            "interface": "CaseAgentRuntime",
+            "normal_sandcastle_entrypoint": (
+                "run({ agent, sandbox, cwd, branchStrategy, "
+                "prompt, logging })"
+            ),
+        },
+    }
+    if workstream_seed_ref is not None:
+        payload["workstream_seed_ref"] = workstream_seed_ref
+        payload["workstream_seed_commit"] = workstream_seed_commit
     request_path.write_text(
-        json.dumps(
-            {
-                "bead_id": issue["id"],
-                "case_checkout": str(case_checkout),
-                "case_cli_shim": str(case_cli_shim),
-                "case_data_dir": str(case_data_dir),
-                "case_dry_run": case_dry_run,
-                "case_runtime_module": (
-                    str(case_runtime_module) if case_runtime_module is not None else None
-                ),
-                "case_codex_session": case_codex_session_metadata(codex_session),
-                "case_task_json": str(task_json),
-                "case_task_markdown": str(task_md),
-                "target_checkout_mode": target_checkout_mode,
-                "target_checkout_path": str(checkout_path),
-                "target_repo": metadata["target_repo"],
-                "target_repo_path": metadata["target_repo_path"],
-                "target_source_checkout": str(source_checkout),
-                "target_worktree_checkout": (
-                    str(target_worktree_checkout)
-                    if target_worktree_checkout is not None
-                    else None
-                ),
-                "target_base_branch": metadata["target_base_branch"],
-                "review_branch": review_branch,
-                "validation_command": validation_command,
-                "sandcastle_runtime_adapter": {
-                    "status": "scaffolded",
-                    "interface": "CaseAgentRuntime",
-                    "normal_sandcastle_entrypoint": (
-                        "run({ agent, sandbox, cwd, branchStrategy, "
-                        "prompt, logging })"
-                    ),
-                },
-            },
-            indent=2,
-            sort_keys=True,
-        )
+        json.dumps(payload, indent=2, sort_keys=True)
         + "\n",
         encoding="utf-8",
     )

@@ -288,6 +288,248 @@ class WorkstreamRunnerTest(unittest.TestCase):
                 for path in requests
             }
             self.assertEqual(review_branches, {"agent/central-3gj-fixture"})
+            for path in requests:
+                self.assertNotIn(
+                    "workstream_seed_ref",
+                    json.loads(path.read_text(encoding="utf-8")),
+                )
+
+    def test_workstream_seed_ref_starts_shared_branch_from_existing_branch(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.git(target_repo, "checkout", "-b", "agent/central-3gj.1")
+            (target_repo / "seeded.txt").write_text(
+                "seeded branch content\n", encoding="utf-8"
+            )
+            self.git(target_repo, "add", "seeded.txt")
+            self.git(target_repo, "commit", "-m", "Seed prior workstream branch")
+            seed_sha = self.git(target_repo, "rev-parse", "HEAD").stdout.strip()
+            self.git(target_repo, "checkout", "main")
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            state_dir = tmp_path / ".automation-simple"
+            events_path = tmp_path / "events.jsonl"
+            validation_command = (
+                f"{sys.executable} -c "
+                "\"import pathlib; "
+                "assert pathlib.Path('seeded.txt').read_text() == "
+                "'seeded branch content\\n'; "
+                "assert pathlib.Path('central-3gj.2.txt').is_file(); "
+                "assert pathlib.Path('central-3gj.3.txt').is_file()\""
+            )
+            workstream = [
+                {
+                    "id": "central-3gj.2",
+                    "title": "Continue seeded branch",
+                    "description": "Create output after prior branch work.",
+                    "status": "open",
+                    "labels": ["project:automation", "ready-for-agent"],
+                    "metadata": self.runnable_metadata(
+                        target_repo,
+                        light_command=None,
+                        validation_command=validation_command,
+                    ),
+                    "parent": "central-3gj",
+                },
+                {
+                    "id": "central-3gj.3",
+                    "title": "Continue after first child",
+                    "description": "Create output after first child.",
+                    "status": "open",
+                    "labels": ["project:automation", "ready-for-agent"],
+                    "metadata": self.runnable_metadata(
+                        target_repo,
+                        light_command=None,
+                        validation_command=validation_command,
+                    ),
+                    "parent": "central-3gj",
+                    "dependencies": [
+                        {
+                            "issue_id": "central-3gj.3",
+                            "depends_on_id": "central-3gj.2",
+                            "type": "blocks",
+                        }
+                    ],
+                }
+            ]
+            workstream_json = tmp_path / "workstream.json"
+            workstream_json.write_text(json.dumps(workstream), encoding="utf-8")
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, subprocess, sys",
+                        "from pathlib import Path",
+                        "task = Path(sys.argv[sys.argv.index('--task') + 1])",
+                        "target = task.parents[3]",
+                        "payload = json.loads(task.read_text(encoding='utf-8'))",
+                        (
+                            "assert (target / 'seeded.txt').read_text("
+                            "encoding='utf-8') == 'seeded branch content\\n'"
+                        ),
+                        "bead_id = payload['id']",
+                        "if bead_id == 'central-3gj.3':",
+                        "    assert (target / 'central-3gj.2.txt').is_file()",
+                        (
+                            "Path(os.environ['EVENTS_PATH']).open('a').write("
+                            "json.dumps({'event':'case','bead':bead_id,"
+                            "'cwd':str(target)}) + '\\n')"
+                        ),
+                        "output = target / f'{bead_id}.txt'",
+                        "output.write_text(f'{bead_id}\\n', encoding='utf-8')",
+                        (
+                            "subprocess.run(['git', 'add', output.name], "
+                            "cwd=target, check=True)"
+                        ),
+                        (
+                            "subprocess.run(['git', 'commit', '-m', "
+                            "f'Implement {bead_id}'], cwd=target, check=True, "
+                            "stdout=subprocess.PIPE, stderr=subprocess.PIPE, "
+                            "text=True)"
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+
+            result = run_cli(
+                "run-workstream",
+                "--parent",
+                "central-3gj",
+                "--workstream-json",
+                str(workstream_json),
+                "--workstream-seed-ref",
+                "agent/central-3gj.1",
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                env={"EVENTS_PATH": str(events_path)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            events = [
+                json.loads(line)
+                for line in events_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [event["bead"] for event in events],
+                ["central-3gj.2", "central-3gj.3"],
+            )
+            worktree_paths = {Path(event["cwd"]) for event in events}
+            self.assertEqual(len(worktree_paths), 1)
+            worktree = next(iter(worktree_paths))
+            self.assertNotEqual(worktree, target_repo)
+            self.assertTrue((worktree / "seeded.txt").is_file())
+            self.assertTrue((worktree / "central-3gj.2.txt").is_file())
+            self.assertTrue((worktree / "central-3gj.3.txt").is_file())
+            self.assertFalse((target_repo / "seeded.txt").exists())
+            self.assertEqual(
+                self.git(target_repo, "branch", "--show-current").stdout.strip(),
+                "main",
+            )
+            self.assertEqual(
+                self.git(worktree, "branch", "--show-current").stdout.strip(),
+                "agent/central-3gj-fixture",
+            )
+            self.assertEqual(
+                self.git(worktree, "rev-parse", "HEAD~2").stdout.strip(),
+                seed_sha,
+            )
+            requests = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in state_dir.glob("runs/*/execution-request.json")
+            ]
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(
+                {
+                    request["review_branch"]
+                    for request in requests
+                },
+                {"agent/central-3gj-fixture"},
+            )
+            seeded_requests = [
+                request for request in requests if "workstream_seed_ref" in request
+            ]
+            self.assertEqual(len(seeded_requests), 1)
+            self.assertEqual(
+                seeded_requests[0]["workstream_seed_ref"],
+                "agent/central-3gj.1",
+            )
+            self.assertEqual(seeded_requests[0]["target_base_branch"], "main")
+
+    def test_missing_workstream_seed_ref_stops_before_case(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            state_dir = tmp_path / ".automation-simple"
+            marker_path = tmp_path / "case-ran"
+            workstream = [
+                {
+                    "id": "central-3gj.2",
+                    "title": "Missing seed branch",
+                    "status": "open",
+                    "labels": ["project:automation", "ready-for-agent"],
+                    "metadata": self.runnable_metadata(
+                        target_repo,
+                        light_command=None,
+                        validation_command="true",
+                    ),
+                    "parent": "central-3gj",
+                }
+            ]
+            workstream_json = tmp_path / "workstream.json"
+            workstream_json.write_text(json.dumps(workstream), encoding="utf-8")
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "from pathlib import Path",
+                        f"Path({str(marker_path)!r}).write_text('ran\\n', encoding='utf-8')",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+
+            result = run_cli(
+                "run-workstream",
+                "--parent",
+                "central-3gj",
+                "--workstream-json",
+                str(workstream_json),
+                "--workstream-seed-ref",
+                "missing/ref",
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(
+                "workstream seed ref does not resolve to a commit: missing/ref",
+                result.stderr,
+            )
+            self.assertIn("run-workstream stopped after central-3gj.2", result.stderr)
+            self.assertFalse(marker_path.exists())
+            self.assertFalse((state_dir / "runs").exists())
 
     def test_stops_on_case_failure_before_light_or_final_validation(self) -> None:
         with TemporaryDirectory() as tmp:

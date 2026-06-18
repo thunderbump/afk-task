@@ -173,6 +173,56 @@ class WorktreeProvisioningTest(unittest.TestCase):
                 .splitlines(),
             )
 
+    def test_pr_url_start_ref_fetches_origin_pull_head(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_checkout = tmp_path / "source"
+            self.init_source_repo(source_checkout)
+            origin = tmp_path / "origin.git"
+            self.git(tmp_path, "init", "--bare", str(origin))
+            self.git(source_checkout, "remote", "add", "origin", str(origin))
+            self.git(source_checkout, "push", "origin", "main")
+            self.git(source_checkout, "checkout", "-b", "agent/seed-pr")
+            (source_checkout / "seeded.txt").write_text(
+                "seeded from pr\n", encoding="utf-8"
+            )
+            self.git(source_checkout, "add", "seeded.txt")
+            self.git(source_checkout, "commit", "-m", "Seed PR branch")
+            seed_sha = self.git(source_checkout, "rev-parse", "HEAD").stdout.strip()
+            self.git(source_checkout, "push", "origin", "HEAD:refs/pull/12/head")
+            self.git(source_checkout, "checkout", "main")
+            self.git(source_checkout, "branch", "-D", "agent/seed-pr")
+
+            target = provision_target_worktree(
+                source_checkout=source_checkout,
+                worktree_root=tmp_path / "worktrees",
+                base_branch="main",
+                review_branch="agent/pr-seeded",
+                start_ref="https://github.com/local/workstream-target/pull/12",
+            )
+
+            self.assertEqual(
+                target.start_ref,
+                "refs/automation-simple/workstream-seeds/pr-12",
+            )
+            self.assertEqual(target.start_commit, seed_sha)
+            self.assertEqual(
+                self.git(target.worktree_checkout, "rev-parse", "HEAD").stdout.strip(),
+                seed_sha,
+            )
+            self.assertEqual(
+                self.git(
+                    target.worktree_checkout, "branch", "--show-current"
+                ).stdout.strip(),
+                "agent/pr-seeded",
+            )
+            self.assertEqual(
+                (target.worktree_checkout / "seeded.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "seeded from pr\n",
+            )
+
     def test_missing_base_branch_fails_before_creating_worktree(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

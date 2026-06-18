@@ -17,6 +17,14 @@ class ProvisionedTargetWorktree:
     worktree_checkout: Path
     base_branch: str
     review_branch: str
+    start_ref: str
+    start_commit: str
+
+
+@dataclass(frozen=True)
+class ResolvedStartRef:
+    ref: str
+    commit: str
 
 
 def provision_target_worktree(
@@ -25,11 +33,27 @@ def provision_target_worktree(
     worktree_root: Path,
     base_branch: str,
     review_branch: str,
+    start_ref: str | None = None,
 ) -> ProvisionedTargetWorktree:
     source_checkout = source_checkout.resolve()
     worktree_root = worktree_root.resolve()
     source_checkout = require_git_toplevel(source_checkout)
     require_local_branch(source_checkout, base_branch)
+    if start_ref is None:
+        resolved_start_ref = ResolvedStartRef(
+            ref=base_branch,
+            commit=require_commit_ref(
+                source_checkout,
+                base_branch,
+                label="target base branch",
+            ),
+        )
+    else:
+        resolved_start_ref = resolve_start_ref(
+            source_checkout,
+            start_ref,
+            label="workstream seed ref",
+        )
 
     worktree_checkout = worktree_path_for(
         source_checkout=source_checkout,
@@ -39,7 +63,7 @@ def provision_target_worktree(
     create_or_reuse_worktree(
         source_checkout=source_checkout,
         worktree_checkout=worktree_checkout,
-        base_branch=base_branch,
+        start_ref=resolved_start_ref.ref,
         review_branch=review_branch,
     )
 
@@ -48,6 +72,8 @@ def provision_target_worktree(
         worktree_checkout=worktree_checkout,
         base_branch=base_branch,
         review_branch=review_branch,
+        start_ref=resolved_start_ref.ref,
+        start_commit=resolved_start_ref.commit,
     )
 
 
@@ -71,6 +97,51 @@ def require_local_branch(checkout: Path, branch: str) -> None:
         )
 
 
+def require_commit_ref(checkout: Path, ref: str, *, label: str) -> str:
+    result = run_git(checkout, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if result.returncode != 0:
+        raise WorktreeProvisioningError(
+            f"{label} does not resolve to a commit: {ref}"
+        )
+    return result.stdout.strip()
+
+
+def resolve_start_ref(checkout: Path, ref: str, *, label: str) -> ResolvedStartRef:
+    pr_number = github_pr_number(ref)
+    if pr_number is not None:
+        fetched_ref = f"refs/automation-simple/workstream-seeds/pr-{pr_number}"
+        result = run_git(
+            checkout,
+            "fetch",
+            "origin",
+            f"+refs/pull/{pr_number}/head:{fetched_ref}",
+        )
+        if result.returncode != 0:
+            raise WorktreeProvisioningError(
+                f"could not fetch {label} PR {pr_number} from origin: "
+                f"{git_error_message(result)}"
+            )
+        return ResolvedStartRef(
+            ref=fetched_ref,
+            commit=require_commit_ref(checkout, fetched_ref, label=label),
+        )
+
+    return ResolvedStartRef(
+        ref=ref,
+        commit=require_commit_ref(checkout, ref, label=label),
+    )
+
+
+def github_pr_number(ref: str) -> str | None:
+    match = re.match(
+        r"^https://github\.com/[^/]+/[^/]+/pull/([0-9]+)(?:[/?#].*)?$",
+        ref,
+    )
+    if match is None:
+        return None
+    return match.group(1)
+
+
 def worktree_path_for(
     *,
     source_checkout: Path,
@@ -91,14 +162,14 @@ def create_or_reuse_worktree(
     *,
     source_checkout: Path,
     worktree_checkout: Path,
-    base_branch: str,
+    start_ref: str,
     review_branch: str,
 ) -> None:
     if worktree_checkout.exists() and any(worktree_checkout.iterdir()):
         reset_existing_worktree(
             source_checkout=source_checkout,
             worktree_checkout=worktree_checkout,
-            base_branch=base_branch,
+            start_ref=start_ref,
             review_branch=review_branch,
         )
         return
@@ -111,7 +182,7 @@ def create_or_reuse_worktree(
         "-B",
         review_branch,
         str(worktree_checkout),
-        base_branch,
+        start_ref,
     )
     if result.returncode != 0:
         raise WorktreeProvisioningError(
@@ -124,7 +195,7 @@ def reset_existing_worktree(
     *,
     source_checkout: Path,
     worktree_checkout: Path,
-    base_branch: str,
+    start_ref: str,
     review_branch: str,
 ) -> None:
     if not worktree_checkout.is_dir():
@@ -148,11 +219,11 @@ def reset_existing_worktree(
         "checkout",
         "-B",
         review_branch,
-        base_branch,
+        start_ref,
     )
     if checkout.returncode != 0:
         raise WorktreeProvisioningError(
-            f"could not reset review branch {review_branch} to {base_branch}: "
+            f"could not reset review branch {review_branch} to {start_ref}: "
             f"{git_error_message(checkout)}"
         )
     require_clean_worktree(worktree_checkout)
