@@ -293,7 +293,13 @@ class RunBeadCliTest(unittest.TestCase):
             shim_text = case_cli_shim.read_text(encoding="utf-8")
             self.assertIn("CASE_CHECKOUT=", shim_text)
             self.assertIn(str(case_checkout), shim_text)
-            self.assertIn('exec bun "$CASE_CHECKOUT/src/index.ts" "$@"', shim_text)
+            self.assertIn("CASE_COMMAND=", shim_text)
+            self.assertIn(str(fake_case), shim_text)
+            self.assertIn(
+                'exec "$CASE_COMMAND" "$CASE_CHECKOUT/src/index.ts" "$@"',
+                shim_text,
+            )
+            self.assertNotIn("exec bun", shim_text)
             self.assertIsNone(fake_case_record["beads_password"])
             self.assertIsNone(fake_case_record["openai_api_key"])
             self.assertIsNone(fake_case_record["pi_coding_agent_dir"])
@@ -400,6 +406,37 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertIn("pass --case-checkout", result.stderr)
             self.assertIn("CASE_CHECKOUT", result.stderr)
             self.assertFalse(fake_case.with_suffix(".json").exists())
+            self.assertFalse((target_repo / ".case").exists())
+            self.assertFalse(state_dir.exists())
+
+    def test_missing_case_command_configuration_stops_before_case_state(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.13")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.13",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                "definitely-missing-case-command",
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("run-bead missing Case command", result.stderr)
+            self.assertIn("definitely-missing-case-command", result.stderr)
             self.assertFalse((target_repo / ".case").exists())
             self.assertFalse(state_dir.exists())
 
@@ -587,7 +624,7 @@ class RunBeadCliTest(unittest.TestCase):
                 self.assertFalse(fake_case.with_suffix(".json").exists())
                 self.assertFalse((target_repo / ".case").exists())
 
-    def test_case_cli_shim_preserves_agent_cwd_and_uses_absolute_case_entrypoint(
+    def test_case_cli_shim_uses_explicit_case_command_with_restricted_path(
         self,
     ) -> None:
         with TemporaryDirectory() as tmp:
@@ -597,25 +634,25 @@ class RunBeadCliTest(unittest.TestCase):
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
-            fake_bin = tmp_path / "bin"
-            fake_bin.mkdir()
-            fake_bun = fake_bin / "bun"
-            fake_bun.write_text(
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
                 "\n".join(
                     [
                         "#!/usr/bin/env python3",
                         "import json, os, sys",
                         "from pathlib import Path",
-                        "Path(os.environ['FAKE_BUN_RECORD']).write_text(json.dumps({",
+                        "record_path = os.environ.get('FAKE_CASE_RECORD')",
+                        "if record_path:",
+                        "    Path(record_path).write_text(json.dumps({",
                         "  'argv': sys.argv[1:],",
                         "  'cwd': os.getcwd(),",
-                        "}) + '\\n', encoding='utf-8')",
+                        "    }) + '\\n', encoding='utf-8')",
                     ]
                 ),
                 encoding="utf-8",
             )
-            fake_bun.chmod(0o755)
-            record_path = tmp_path / "bun-record.json"
+            fake_case.chmod(0o755)
+            record_path = tmp_path / "case-record.json"
             bead_json = tmp_path / "bead.json"
             self.write_eligible_bead(bead_json, target_repo, "central-run.9")
 
@@ -630,7 +667,7 @@ class RunBeadCliTest(unittest.TestCase):
                 "--case-checkout",
                 str(case_checkout),
                 "--case-command",
-                "true",
+                str(fake_case),
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -643,9 +680,8 @@ class RunBeadCliTest(unittest.TestCase):
                 ],
                 cwd=target_repo,
                 env={
-                    **os.environ,
-                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
-                    "FAKE_BUN_RECORD": str(record_path),
+                    "PATH": f"{case_cli_shim.parent}{os.pathsep}{os.defpath}",
+                    "FAKE_CASE_RECORD": str(record_path),
                 },
                 text=True,
                 stdout=subprocess.PIPE,
@@ -656,14 +692,96 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertEqual(
                 shim_result.returncode, 0, shim_result.stdout + shim_result.stderr
             )
-            bun_record = json.loads(record_path.read_text(encoding="utf-8"))
-            self.assertEqual(bun_record["cwd"], str(target_repo))
+            case_record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(case_record["cwd"], str(target_repo))
             self.assertEqual(
-                bun_record["argv"],
+                case_record["argv"],
                 [
                     str(case_checkout / "src" / "index.ts"),
                     "status",
                     ".case/tasks/active/central-run.9.task.json",
+                ],
+            )
+
+    def test_case_cli_shim_uses_path_resolved_case_command_with_restricted_path(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            fake_case = fake_bin / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "record_path = os.environ.get('FAKE_CASE_RECORD')",
+                        "if record_path:",
+                        "    Path(record_path).write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "  'cwd': os.getcwd(),",
+                        "    }) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            record_path = tmp_path / "case-record.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.12")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.12",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                "fake-case",
+                env={"PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            shim_result = subprocess.run(
+                [
+                    str(case_cli_shim),
+                    "status",
+                    ".case/tasks/active/central-run.12.task.json",
+                ],
+                cwd=target_repo,
+                env={
+                    "PATH": f"{case_cli_shim.parent}{os.pathsep}{os.defpath}",
+                    "FAKE_CASE_RECORD": str(record_path),
+                },
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(
+                shim_result.returncode, 0, shim_result.stdout + shim_result.stderr
+            )
+            case_record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(case_record["cwd"], str(target_repo))
+            self.assertEqual(
+                case_record["argv"],
+                [
+                    str(case_checkout / "src" / "index.ts"),
+                    "status",
+                    ".case/tasks/active/central-run.12.task.json",
                 ],
             )
 

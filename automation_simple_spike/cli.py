@@ -6,6 +6,7 @@ import binascii
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -354,6 +355,13 @@ def run_bead(
             file=sys.stderr,
         )
         return 1
+    resolved_case_command = resolve_case_command(case_command)
+    if resolved_case_command is None:
+        print(
+            f"run-bead missing Case command: {case_command} was not found",
+            file=sys.stderr,
+        )
+        return 1
 
     metadata = issue["metadata"]
     target_source_checkout = Path(str(metadata["target_repo_path"])).resolve()
@@ -406,6 +414,7 @@ def run_bead(
     case_cli_shim = write_case_cli_shim(
         state_dir=state_dir,
         case_checkout=case_checkout,
+        case_command=resolved_case_command,
     )
     request_path = write_execution_request(
         state_dir=state_dir,
@@ -443,7 +452,7 @@ def run_bead(
             return 1
     generated_task_json = task_json.read_text(encoding="utf-8") if case_dry_run else None
     result = run_case_command(
-        case_command=case_command,
+        case_command=resolved_case_command,
         case_checkout=case_checkout,
         case_data_dir=case_data,
         case_cli_shim=case_cli_shim,
@@ -985,7 +994,9 @@ def write_case_projects_manifest(
     return projects_path
 
 
-def write_case_cli_shim(*, state_dir: Path, case_checkout: Path) -> Path:
+def write_case_cli_shim(
+    *, state_dir: Path, case_checkout: Path, case_command: str
+) -> Path:
     shim_dir = state_dir / "case-bin"
     shim_dir.mkdir(parents=True, exist_ok=True)
     shim_path = shim_dir / "ca"
@@ -995,7 +1006,8 @@ def write_case_cli_shim(*, state_dir: Path, case_checkout: Path) -> Path:
                 "#!/usr/bin/env sh",
                 "set -eu",
                 f"CASE_CHECKOUT={shlex.quote(str(case_checkout))}",
-                'exec bun "$CASE_CHECKOUT/src/index.ts" "$@"',
+                f"CASE_COMMAND={shlex.quote(case_command)}",
+                'exec "$CASE_COMMAND" "$CASE_CHECKOUT/src/index.ts" "$@"',
                 "",
             ]
         ),
@@ -1003,6 +1015,10 @@ def write_case_cli_shim(*, state_dir: Path, case_checkout: Path) -> Path:
     )
     shim_path.chmod(0o755)
     return shim_path
+
+
+def resolve_case_command(case_command: str) -> str | None:
+    return shutil.which(os.path.expanduser(case_command))
 
 
 def write_pi_codex_models_config(codex_session: CaseCodexSession) -> Path:
