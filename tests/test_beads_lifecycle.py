@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ from automation_simple_spike.beads_lifecycle import (
     BeadsLifecycleClient,
     LifecycleRun,
 )
+from automation_simple_spike.cli import lifecycle_run_with_validation_result
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -397,6 +399,39 @@ class BeadsLifecycleTest(unittest.TestCase):
                 transcript_path.read_text(encoding="utf-8"),
             )
 
+    def test_run_success_records_validation_worker_evidence_result(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            client, transcript_path, _secret_value = self.client(tmp_path)
+            evidence_dir = (
+                tmp_path
+                / ".automation-simple"
+                / "runs"
+                / "run-123"
+                / "validation-evidence"
+            )
+            run = replace(
+                self.run_state(tmp_path),
+                validation_evidence_path=evidence_dir,
+                validation_worker_status="passed",
+            )
+
+            with self.transcript_env(transcript_path):
+                client.record_success(
+                    run,
+                    commit_sha="abc123def456",
+                    interpreted_exit_code=0,
+                    close_bead=False,
+                )
+
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+            metadata = self.metadata_from_update(transcript[0]["argv"])
+            self.assertEqual(
+                metadata["last_afk_validation_evidence_path"],
+                str(evidence_dir),
+            )
+            self.assertEqual(metadata["last_afk_validation_worker_status"], "passed")
+
     def test_run_failure_comments_and_clears_active_state(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -461,6 +496,92 @@ class BeadsLifecycleTest(unittest.TestCase):
             )
             transcript_text = transcript_path.read_text(encoding="utf-8")
             self.assertNotIn(secret_value, transcript_text)
+
+    def test_run_failure_comments_validation_worker_status_and_evidence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            client, transcript_path, _secret_value = self.client(tmp_path)
+            evidence_dir = (
+                tmp_path
+                / ".automation-simple"
+                / "runs"
+                / "run-123"
+                / "validation-evidence"
+            )
+            run = replace(
+                self.run_state(tmp_path),
+                validation_evidence_path=evidence_dir,
+                validation_worker_status="failed",
+                validation_failure_category="harness_timeout",
+            )
+
+            with self.transcript_env(transcript_path):
+                client.record_failure(
+                    run,
+                    interpreted_exit_code=1,
+                    failure_summary="Case command exited 1",
+                )
+
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+            self.assertIn("Validation worker status: failed", transcript[0]["stdin"])
+            self.assertIn(
+                "Validation failure category: harness_timeout", transcript[0]["stdin"]
+            )
+            self.assertIn(f"Validation evidence: {evidence_dir}", transcript[0]["stdin"])
+            metadata = self.metadata_from_update(transcript[1]["argv"])
+            self.assertEqual(
+                metadata["last_afk_validation_evidence_path"],
+                str(evidence_dir),
+            )
+            self.assertEqual(metadata["last_afk_validation_worker_status"], "failed")
+            self.assertEqual(
+                metadata["last_afk_validation_failure_category"],
+                "harness_timeout",
+            )
+
+    def test_missing_validation_worker_result_is_summarized(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            evidence_dir = tmp_path / "validation-evidence"
+            evidence_dir.mkdir()
+            run = replace(
+                self.run_state(tmp_path),
+                validation_evidence_path=evidence_dir,
+            )
+
+            summarized = lifecycle_run_with_validation_result(run)
+
+            self.assertEqual(summarized.validation_worker_status, "missing_result")
+            self.assertEqual(summarized.validation_evidence_path, evidence_dir)
+
+    def test_validation_worker_result_is_summarized_without_logs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            evidence_dir = tmp_path / "validation-evidence"
+            evidence_dir.mkdir()
+            (evidence_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "failure_category": "harness_timeout",
+                        "logs": "large logs should stay in the artifact only",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            run = replace(
+                self.run_state(tmp_path),
+                validation_evidence_path=evidence_dir,
+            )
+
+            summarized = lifecycle_run_with_validation_result(run)
+
+            self.assertEqual(summarized.validation_worker_status, "failed")
+            self.assertEqual(
+                summarized.validation_failure_category,
+                "harness_timeout",
+            )
 
     def test_cli_lifecycle_close_preflight_records_failure_before_case_when_gh_is_unauthed(
         self,

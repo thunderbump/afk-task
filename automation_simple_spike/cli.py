@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -510,6 +510,7 @@ def run_bead(
     except (TargetRepoPreparationError, WorktreeProvisioningError) as error:
         print(f"run-bead target repo invalid: {error}", file=sys.stderr)
         return 1
+    run_dir = state_dir.resolve() / "runs" / make_run_id(bead_id)
     try:
         validation_command = compile_validation_metadata(
             issue=issue,
@@ -518,6 +519,7 @@ def run_bead(
             target_checkout_path=target_repo,
             target_source_checkout=target_source_checkout,
             target_worktree_checkout=target_worktree_checkout,
+            run_dir=run_dir,
         )
     except ValueError as error:
         print(f"run-bead validation metadata invalid: {error}", file=sys.stderr)
@@ -560,6 +562,7 @@ def run_bead(
         codex_session=codex_session,
         workstream_seed_ref=workstream_seed_ref,
         workstream_seed_commit=workstream_seed_commit,
+        run_dir=run_dir,
     )
     lifecycle_run = None
     if lifecycle_client is not None:
@@ -572,6 +575,7 @@ def run_bead(
             target_source_checkout=target_source_checkout,
             target_worktree_checkout=target_worktree_checkout,
             archive_path=request_path.parent,
+            validation_evidence_path=validation_evidence_path(issue),
         )
         try:
             lifecycle_client.record_start(lifecycle_run)
@@ -604,6 +608,8 @@ def run_bead(
     )
     if interpreted_returncode != 0:
         failure_summary = case_failure_summary(result)
+        if lifecycle_run is not None:
+            lifecycle_run = lifecycle_run_with_validation_result(lifecycle_run)
         if lifecycle_client is not None and lifecycle_run is not None:
             try:
                 lifecycle_client.record_failure(
@@ -622,7 +628,7 @@ def run_bead(
     if lifecycle_client is not None and lifecycle_run is not None:
         try:
             lifecycle_client.record_success(
-                lifecycle_run,
+                lifecycle_run_with_validation_result(lifecycle_run),
                 commit_sha=target_head_commit(target_repo),
                 interpreted_exit_code=interpreted_returncode,
                 close_bead=close_bead_on_success,
@@ -892,6 +898,7 @@ def compile_validation_metadata(
     target_checkout_path: Path,
     target_source_checkout: Path,
     target_worktree_checkout: Path | None,
+    run_dir: Path | None = None,
 ) -> str:
     metadata = issue["metadata"]
     if not is_worker_validation_requested(metadata):
@@ -908,6 +915,7 @@ def compile_validation_metadata(
         target_checkout_path=target_checkout_path,
         target_source_checkout=target_source_checkout,
         target_worktree_checkout=target_worktree_checkout,
+        run_dir=run_dir,
     )
     compiled = f"{command} --request {shlex.quote(str(request_path))}"
     metadata["validation_command"] = compiled
@@ -922,11 +930,18 @@ def write_validation_worker_request(
     target_checkout_path: Path,
     target_source_checkout: Path,
     target_worktree_checkout: Path | None,
+    run_dir: Path | None = None,
 ) -> Path:
     metadata = issue["metadata"]
     request_dir = state_dir.resolve() / "validation-requests"
     request_dir.mkdir(parents=True, exist_ok=True)
     request_path = request_dir / f"{issue['id']}.json"
+    evidence_dir = validation_evidence_dir_for(
+        state_dir=state_dir,
+        run_dir=run_dir,
+        bead_id=str(issue["id"]),
+    )
+    evidence_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "bead_id": issue["id"],
         "mode": worker_metadata_value(
@@ -963,11 +978,7 @@ def write_validation_worker_request(
             flat_keys="validation_commit",
             worker_keys="commit",
         ),
-        "evidence_dir": worker_metadata_value(
-            metadata,
-            flat_keys="validation_evidence_dir",
-            worker_keys=("evidence_dir", "evidence_directory"),
-        ),
+        "evidence_dir": str(evidence_dir),
         "target_repo": metadata["target_repo"],
         "target_repo_path": metadata["target_repo_path"],
         "target_base_branch": metadata["target_base_branch"],
@@ -984,7 +995,48 @@ def write_validation_worker_request(
         redact_sensitive_text(json.dumps(payload, indent=2, sort_keys=True)) + "\n",
         encoding="utf-8",
     )
+    metadata["validation_worker_evidence_dir"] = str(evidence_dir)
+    metadata["validation_worker_request_path"] = str(request_path)
     return request_path
+
+
+def validation_evidence_dir_for(
+    *, state_dir: Path, run_dir: Path | None, bead_id: str
+) -> Path:
+    if run_dir is not None:
+        return run_dir.resolve() / "validation-evidence"
+    return state_dir.resolve() / "runs" / make_run_id(bead_id) / "validation-evidence"
+
+
+def validation_evidence_path(issue: dict[str, Any]) -> Path | None:
+    path = issue.get("metadata", {}).get("validation_worker_evidence_dir")
+    if isinstance(path, str) and path:
+        return Path(path)
+    return None
+
+
+def lifecycle_run_with_validation_result(run: LifecycleRun) -> LifecycleRun:
+    if run.validation_evidence_path is None:
+        return run
+    result_path = run.validation_evidence_path / "result.json"
+    if not result_path.is_file():
+        return replace(run, validation_worker_status="missing_result")
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return replace(run, validation_worker_status="invalid_result")
+    if not isinstance(payload, dict):
+        return replace(run, validation_worker_status="invalid_result")
+
+    status = payload.get("status") or payload.get("result") or payload.get("outcome")
+    category = payload.get("failure_category") or payload.get("category")
+    return replace(
+        run,
+        validation_worker_status=str(status) if status not in (None, "") else None,
+        validation_failure_category=(
+            str(category) if category not in (None, "") else None
+        ),
+    )
 
 
 def review_branch_for(*, bead_id: str, metadata: dict[str, Any]) -> str:
@@ -1477,6 +1529,7 @@ def write_execution_request(
     codex_session: CaseCodexSession | None = None,
     workstream_seed_ref: str | None = None,
     workstream_seed_commit: str | None = None,
+    run_dir: Path | None = None,
 ) -> Path:
     metadata = issue["metadata"]
     validation_command = redact_sensitive_text(str(metadata["validation_command"]))
@@ -1484,7 +1537,7 @@ def write_execution_request(
         str(metadata["target_repo_path"])
     ).resolve()
     checkout_path = target_checkout_path or source_checkout
-    run_dir = state_dir / "runs" / make_run_id(str(issue["id"]))
+    run_dir = run_dir or state_dir / "runs" / make_run_id(str(issue["id"]))
     run_dir.mkdir(parents=True, exist_ok=True)
     request_path = run_dir / "execution-request.json"
     payload: dict[str, Any] = {
@@ -1521,6 +1574,12 @@ def write_execution_request(
             ),
         },
     }
+    worker_metadata = validation_worker_execution_metadata(
+        metadata=metadata,
+        validation_command=validation_command,
+    )
+    if worker_metadata is not None:
+        payload["validation_worker"] = worker_metadata
     if workstream_seed_ref is not None:
         payload["workstream_seed_ref"] = workstream_seed_ref
         payload["workstream_seed_commit"] = workstream_seed_commit
@@ -1530,6 +1589,40 @@ def write_execution_request(
         encoding="utf-8",
     )
     return request_path
+
+
+def validation_worker_execution_metadata(
+    *, metadata: dict[str, Any], validation_command: str
+) -> dict[str, Any] | None:
+    request_path = metadata.get("validation_worker_request_path")
+    evidence_dir = metadata.get("validation_worker_evidence_dir")
+    if not request_path or not evidence_dir:
+        return None
+    return {
+        "request_path": str(request_path),
+        "generated_command": validation_command,
+        "evidence_dir": str(evidence_dir),
+        "profile": worker_metadata_value(
+            metadata,
+            flat_keys="validation_profile",
+            worker_keys="profile",
+        ),
+        "timeout_seconds": worker_metadata_value(
+            metadata,
+            flat_keys="validation_timeout_seconds",
+            worker_keys="timeout_seconds",
+        ),
+        "ref": worker_metadata_value(
+            metadata,
+            flat_keys="validation_ref",
+            worker_keys="ref",
+        ),
+        "commit": worker_metadata_value(
+            metadata,
+            flat_keys="validation_commit",
+            worker_keys="commit",
+        ),
+    }
 
 
 def case_codex_session_metadata(

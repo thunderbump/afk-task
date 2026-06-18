@@ -353,6 +353,10 @@ class RunBeadCliTest(unittest.TestCase):
                         "from pathlib import Path",
                         "request_path = Path(sys.argv[sys.argv.index('--request') + 1])",
                         "payload = json.loads(request_path.read_text(encoding='utf-8'))",
+                        "evidence_dir = Path(payload['evidence_dir'])",
+                        "evidence_dir.mkdir(parents=True, exist_ok=True)",
+                        "result_path = evidence_dir / 'result.json'",
+                        "result_path.write_text(json.dumps({'status': 'passed'}) + '\\n', encoding='utf-8')",
                         "Path(os.environ['FAKE_WORKER_RECORD']).write_text(json.dumps({",
                         "    'argv': sys.argv[1:],",
                         "    'cwd': os.getcwd(),",
@@ -427,9 +431,11 @@ class RunBeadCliTest(unittest.TestCase):
                 self.assertEqual(validation_request["repo"], "local/test")
                 self.assertEqual(validation_request["ref"], "refs/heads/main")
                 self.assertEqual(validation_request["commit"], target_commit)
-                self.assertEqual(
-                    validation_request["evidence_dir"], "artifacts/validation"
-                )
+                evidence_dir = Path(validation_request["evidence_dir"])
+                self.assertTrue(evidence_dir.is_absolute())
+                self.assertTrue(evidence_dir.is_dir())
+                self.assertEqual(evidence_dir.name, "validation-evidence")
+                self.assertEqual(evidence_dir.parent.parent, state_dir / "runs")
                 self.assertEqual(
                     validation_request["review_branch"],
                     "agent/central-run.worker",
@@ -469,6 +475,25 @@ class RunBeadCliTest(unittest.TestCase):
                 self.assertEqual(commands["test"], expected_command)
                 self.assertEqual(commands["check"], expected_command)
 
+                execution_requests = list(
+                    (state_dir / "runs").glob("*/execution-request.json")
+                )
+                self.assertEqual(len(execution_requests), 1)
+                execution_request = json.loads(
+                    execution_requests[0].read_text(encoding="utf-8")
+                )
+                worker_execution = execution_request["validation_worker"]
+                self.assertEqual(worker_execution["request_path"], str(request_path))
+                self.assertEqual(
+                    worker_execution["generated_command"],
+                    expected_command,
+                )
+                self.assertEqual(worker_execution["evidence_dir"], str(evidence_dir))
+                self.assertEqual(worker_execution["profile"], "safe")
+                self.assertEqual(worker_execution["timeout_seconds"], 900)
+                self.assertEqual(worker_execution["ref"], "refs/heads/main")
+                self.assertEqual(worker_execution["commit"], target_commit)
+
                 worker_result = subprocess.run(
                     task_json["checkCommand"],
                     cwd=target_repo,
@@ -496,6 +521,13 @@ class RunBeadCliTest(unittest.TestCase):
                     request_path.resolve(),
                 )
                 self.assertEqual(worker_record["payload"], validation_request)
+                self.assertEqual(
+                    json.loads(
+                        (evidence_dir / "result.json").read_text(encoding="utf-8")
+                    ),
+                    {"status": "passed"},
+                )
+                self.assertFalse((target_repo / "artifacts" / "validation").exists())
             finally:
                 shutil.rmtree(state_dir, ignore_errors=True)
 
