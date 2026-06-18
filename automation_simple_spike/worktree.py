@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -165,6 +166,12 @@ def create_or_reuse_worktree(
     start_ref: str,
     review_branch: str,
 ) -> None:
+    require_review_branch_available(
+        source_checkout=source_checkout,
+        worktree_checkout=worktree_checkout,
+        review_branch=review_branch,
+    )
+
     if worktree_checkout.exists() and any(worktree_checkout.iterdir()):
         reset_existing_worktree(
             source_checkout=source_checkout,
@@ -189,6 +196,61 @@ def create_or_reuse_worktree(
             f"could not create target worktree {worktree_checkout}: "
             f"{git_error_message(result)}"
         )
+
+
+def require_review_branch_available(
+    *,
+    source_checkout: Path,
+    worktree_checkout: Path,
+    review_branch: str,
+) -> None:
+    existing_checkout = worktree_checkout_for_branch(source_checkout, review_branch)
+    if existing_checkout is None:
+        return
+    target_checkout = worktree_checkout.resolve()
+    if existing_checkout == target_checkout:
+        return
+
+    archive_branch = sanitize_path_segment(review_branch) or "review"
+    raise WorktreeProvisioningError(
+        f"review branch is already checked out: {review_branch}\n"
+        f"existing worktree: {existing_checkout}\n"
+        f"target worktree: {target_checkout}\n"
+        "The existing worktree was left in place because it may contain "
+        "failed-run evidence. To retry safely, switch the existing generated "
+        "worktree to an archive branch, for example:\n"
+        f"  git -C {shlex.quote(str(existing_checkout))} "
+        f"switch -c archive/{archive_branch}-failed-run\n"
+        "Or remove it only if intentionally disposable:\n"
+        f"  git worktree remove {shlex.quote(str(existing_checkout))}"
+    )
+
+
+def worktree_checkout_for_branch(checkout: Path, branch: str) -> Path | None:
+    result = run_git(checkout, "worktree", "list", "--porcelain")
+    if result.returncode != 0:
+        raise WorktreeProvisioningError(
+            f"could not inspect git worktrees for {checkout}: "
+            f"{git_error_message(result)}"
+        )
+
+    current_worktree: Path | None = None
+    target_ref = f"refs/heads/{branch}"
+    for line in result.stdout.splitlines():
+        if not line:
+            current_worktree = None
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current_worktree = Path(value).resolve()
+        elif (
+            key == "branch"
+            and value == target_ref
+            and current_worktree is not None
+        ):
+            return current_worktree
+
+    return None
 
 
 def reset_existing_worktree(

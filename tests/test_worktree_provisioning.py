@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ import unittest
 from automation_simple_spike.worktree import (
     WorktreeProvisioningError,
     provision_target_worktree,
+    worktree_path_for,
 )
 
 
@@ -171,6 +173,65 @@ class WorktreeProvisioningTest(unittest.TestCase):
                 )
                 .stdout
                 .splitlines(),
+            )
+
+    def test_review_branch_checked_out_in_stale_worktree_fails_with_remediation(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_checkout = tmp_path / "source"
+            self.init_source_repo(source_checkout)
+            review_branch = "agent/central-stale"
+            stale_checkout = (
+                tmp_path
+                / ".automation-simple"
+                / "old-run"
+                / "target-worktrees"
+                / "source-old"
+                / "agent-central-stale"
+            )
+            worktree_root = (
+                tmp_path / ".automation-simple" / "new-run" / "target-worktrees"
+            )
+            target_checkout = worktree_path_for(
+                source_checkout=source_checkout,
+                worktree_root=worktree_root,
+                review_branch=review_branch,
+            )
+            self.git(
+                source_checkout,
+                "worktree",
+                "add",
+                "-B",
+                review_branch,
+                str(stale_checkout),
+                "main",
+            )
+
+            with self.assertRaisesRegex(
+                WorktreeProvisioningError,
+                re.escape(f"review branch is already checked out: {review_branch}"),
+            ) as caught:
+                provision_target_worktree(
+                    source_checkout=source_checkout,
+                    worktree_root=worktree_root,
+                    base_branch="main",
+                    review_branch=review_branch,
+                )
+
+            message = str(caught.exception)
+            self.assertIn(str(stale_checkout.resolve()), message)
+            self.assertIn(str(target_checkout.resolve()), message)
+            self.assertIn("failed-run evidence", message)
+            self.assertIn("git -C", message)
+            self.assertIn("switch -c archive/agent-central-stale", message)
+            self.assertIn("git worktree remove", message)
+            self.assertFalse(target_checkout.exists())
+            self.assertTrue(stale_checkout.is_dir())
+            self.assertEqual(
+                self.git(stale_checkout, "branch", "--show-current").stdout.strip(),
+                review_branch,
             )
 
     def test_pr_url_start_ref_fetches_origin_pull_head(self) -> None:
