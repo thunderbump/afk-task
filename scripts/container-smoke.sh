@@ -65,7 +65,13 @@ bead_json.write_text(
                 "target_repo_path": str(target_repo),
                 "target_base_branch": "main",
                 "branch_policy": "independent",
-                "validation_command": "true",
+                "validation_mode": "worker",
+                "validation_worker": {
+                    "transport": "local",
+                    "local_command": "python3 -m fake_container_validation_worker",
+                    "profile": "container-smoke",
+                    "timeout_seconds": 30,
+                },
             },
         }
     ),
@@ -100,13 +106,22 @@ fake_case = Path(sys.argv[3])
 
 task = target_repo / ".case/tasks/active/central-container-smoke.1.task.json"
 request = next((state_dir / "runs").glob("*/execution-request.json"))
+validation_request = state_dir / "validation-requests/central-container-smoke.1.json"
 record = json.loads(fake_case.with_suffix(".json").read_text(encoding="utf-8"))
+task_payload = json.loads(task.read_text(encoding="utf-8"))
+validation_payload = json.loads(validation_request.read_text(encoding="utf-8"))
 
 assert task.is_file(), task
 assert request.is_file(), request
+assert validation_request.is_file(), validation_request
 assert record["beads_password"] is None
 assert record["openai_api_key"] is None
+assert "validation_worker_adapter" in task_payload["checkCommand"]
+assert "fake_container_validation_worker" in task_payload["checkCommand"]
+assert validation_payload["profile"] == "container-smoke"
+assert Path(validation_payload["evidence_dir"]).is_absolute()
 print("container smoke passed")
 print(f"task={task}")
 print(f"request={request}")
+print(f"validation_request={validation_request}")
 PY

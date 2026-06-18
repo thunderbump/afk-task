@@ -63,10 +63,77 @@ def load_parent_workstream_issues(
         beads_workspace=beads_workspace,
         beads_password_file=beads_password_file,
     )
-    return [
+    parent_records = [
         *issue_records_from_beads_payload(parent_payload),
         *issue_records_from_beads_payload(children_payload),
     ]
+    external_blocker_records = load_external_blocker_status_records(
+        parent_records,
+        bd_command=bd_command,
+        beads_workspace=beads_workspace,
+        beads_password_file=beads_password_file,
+    )
+    return [*parent_records, *external_blocker_records]
+
+
+def load_external_blocker_status_records(
+    issues: list[dict[str, Any]],
+    *,
+    bd_command: str,
+    beads_workspace: Any,
+    beads_password_file: Any,
+) -> list[dict[str, Any]]:
+    loaded_issue_ids = {
+        issue["id"]
+        for issue in issues
+        if isinstance(issue.get("id"), str) and issue["id"]
+    }
+    blocker_records: list[dict[str, Any]] = []
+    for blocker_id in external_blocker_ids(issues, loaded_issue_ids):
+        blocker_payload = run_bd_json(
+            ["show", blocker_id, "--json"],
+            bd_command=bd_command,
+            beads_workspace=beads_workspace,
+            beads_password_file=beads_password_file,
+        )
+        blocker_records.extend(blocker_status_records(blocker_payload))
+    return blocker_records
+
+
+def external_blocker_ids(
+    issues: list[dict[str, Any]],
+    loaded_issue_ids: set[str],
+) -> list[str]:
+    blocker_ids: list[str] = []
+    seen = set(loaded_issue_ids)
+    for issue in issues:
+        dependencies = issue.get("dependencies")
+        if not isinstance(dependencies, list):
+            continue
+        for dependency in dependencies:
+            if not isinstance(dependency, dict):
+                continue
+            if dependency_kind(dependency) != "blocks":
+                continue
+            if "status" in dependency:
+                continue
+            blocker_id = dependency_blocker_id(dependency)
+            if blocker_id is None or blocker_id in seen:
+                continue
+            blocker_ids.append(blocker_id)
+            seen.add(blocker_id)
+    return blocker_ids
+
+
+def blocker_status_records(payload: Any) -> Iterable[dict[str, Any]]:
+    raw_issues = payload if isinstance(payload, list) else [payload]
+    for raw_issue in raw_issues:
+        if not isinstance(raw_issue, dict):
+            continue
+        issue_id = raw_issue.get("id")
+        if not isinstance(issue_id, str) or not issue_id:
+            continue
+        yield {"id": issue_id, "status": raw_issue.get("status")}
 
 
 def load_workstream_issues(

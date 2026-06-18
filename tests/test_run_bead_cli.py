@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -57,6 +59,7 @@ class RunBeadCliTest(unittest.TestCase):
         target_repo: Path,
         bead_id: str,
         target_base_branch: str = "main",
+        target_repo_name: str = "local/test",
     ) -> None:
         path.write_text(
             json.dumps(
@@ -69,7 +72,7 @@ class RunBeadCliTest(unittest.TestCase):
                     "metadata": {
                         "afk_enabled": True,
                         "afk_runner": "codex",
-                        "target_repo": "local/test",
+                        "target_repo": target_repo_name,
                         "target_repo_path": str(target_repo),
                         "target_base_branch": target_base_branch,
                         "branch_policy": "independent",
@@ -106,6 +109,79 @@ class RunBeadCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         return token
+
+    def write_fake_case(self, path: Path) -> None:
+        path.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, os, sys",
+                    "from pathlib import Path",
+                    "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
+                    "  'argv': sys.argv[1:],",
+                    "  'cwd': os.getcwd(),",
+                    "}) + '\\n', encoding='utf-8')",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    def write_fake_gh(self, bin_dir: Path) -> Path:
+        bin_dir.mkdir()
+        fake_gh = bin_dir / "gh"
+        fake_gh.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, os, sys",
+                    "from pathlib import Path",
+                    "log_path = Path(os.environ['FAKE_GH_LOG'])",
+                    "calls = json.loads(log_path.read_text(encoding='utf-8')) if log_path.exists() else []",
+                    "calls.append(sys.argv[1:])",
+                    "log_path.write_text(json.dumps(calls) + '\\n', encoding='utf-8')",
+                    "if sys.argv[1:3] == ['auth', 'status']:",
+                    "    raise SystemExit(0)",
+                    "if sys.argv[1:3] == ['repo', 'view']:",
+                    "    allowed = set(filter(None, os.environ.get('FAKE_GH_ALLOWED_REPOS', '').split(',')))",
+                    "    repo = sys.argv[3]",
+                    "    if repo in allowed:",
+                    "        print(json.dumps({'nameWithOwner': repo}))",
+                    "        raise SystemExit(0)",
+                    "    print(f'no access to {repo}', file=sys.stderr)",
+                    "    raise SystemExit(1)",
+                    "raise SystemExit(1)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+        return fake_gh
+
+    def write_fake_bd(self, path: Path) -> None:
+        path.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, os, sys",
+                    "from pathlib import Path",
+                    "log_path = Path(os.environ['FAKE_BD_LOG'])",
+                    "calls = json.loads(log_path.read_text(encoding='utf-8')) if log_path.exists() else []",
+                    "calls.append({'argv': sys.argv[1:], 'stdin': sys.stdin.read()})",
+                    "log_path.write_text(json.dumps(calls) + '\\n', encoding='utf-8')",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    def write_fake_beads_workspace(self, path: Path) -> Path:
+        path.mkdir()
+        secrets_dir = path / "secrets"
+        secrets_dir.mkdir()
+        password_file = secrets_dir / "dolt_beads_password.txt"
+        password_file.write_text("dummy-password\n", encoding="utf-8")
+        return password_file
 
     def test_ineligible_bead_stops_before_case_state_or_execution(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -293,7 +369,13 @@ class RunBeadCliTest(unittest.TestCase):
             shim_text = case_cli_shim.read_text(encoding="utf-8")
             self.assertIn("CASE_CHECKOUT=", shim_text)
             self.assertIn(str(case_checkout), shim_text)
-            self.assertIn('exec bun "$CASE_CHECKOUT/src/index.ts" "$@"', shim_text)
+            self.assertIn("CASE_COMMAND=", shim_text)
+            self.assertIn(str(fake_case), shim_text)
+            self.assertIn(
+                'exec "$CASE_COMMAND" "$CASE_CHECKOUT/src/index.ts" "$@"',
+                shim_text,
+            )
+            self.assertNotIn("exec bun", shim_text)
             self.assertIsNone(fake_case_record["beads_password"])
             self.assertIsNone(fake_case_record["openai_api_key"])
             self.assertIsNone(fake_case_record["pi_coding_agent_dir"])
@@ -309,6 +391,689 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertEqual(execution_request["case_cli_shim"], str(case_cli_shim))
             self.assertNotIn("ambient-openai-key", json.dumps(execution_request))
             self.assertNotIn("must-not-reach-case", json.dumps(execution_request))
+
+    def test_close_preflight_uses_github_origin_for_shorthand_target_repo(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.git(
+                target_repo,
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:thunderbump/afk-task.git",
+            )
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            self.write_fake_case(fake_case)
+            beads_workspace = tmp_path / "beads"
+            password_file = self.write_fake_beads_workspace(beads_workspace)
+            fake_bd = tmp_path / "fake-bd"
+            self.write_fake_bd(fake_bd)
+            fake_gh_bin = tmp_path / "bin"
+            self.write_fake_gh(fake_gh_bin)
+            gh_log = tmp_path / "gh-log.json"
+            bd_log = tmp_path / "bd-log.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(
+                bead_json,
+                target_repo,
+                "central-preflight.1",
+                target_repo_name="automation-simple-spike",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-preflight.1",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "PATH": f"{fake_gh_bin}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_GH_ALLOWED_REPOS": "thunderbump/afk-task",
+                    "FAKE_BD_LOG": str(bd_log),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            gh_calls = json.loads(gh_log.read_text(encoding="utf-8"))
+            self.assertEqual(gh_calls[0], ["auth", "status"])
+            self.assertEqual(
+                gh_calls[1],
+                ["repo", "view", "thunderbump/afk-task", "--json", "nameWithOwner"],
+            )
+            execution_request = json.loads(
+                next(state_dir.glob("runs/*/execution-request.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(execution_request["target_repo"], "thunderbump/afk-task")
+            self.assertEqual(
+                execution_request["target_repo_metadata"],
+                "automation-simple-spike",
+            )
+            task_json = json.loads(
+                (
+                    target_repo
+                    / ".case"
+                    / "tasks"
+                    / "active"
+                    / "central-preflight.1.task.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(task_json["repo"], "thunderbump/afk-task")
+
+    def test_close_preflight_keeps_matching_canonical_target_repo(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.git(
+                target_repo,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ThunderBump/afk-task.git",
+            )
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            self.write_fake_case(fake_case)
+            beads_workspace = tmp_path / "beads"
+            password_file = self.write_fake_beads_workspace(beads_workspace)
+            fake_bd = tmp_path / "fake-bd"
+            self.write_fake_bd(fake_bd)
+            fake_gh_bin = tmp_path / "bin"
+            self.write_fake_gh(fake_gh_bin)
+            gh_log = tmp_path / "gh-log.json"
+            bd_log = tmp_path / "bd-log.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(
+                bead_json,
+                target_repo,
+                "central-preflight.2",
+                target_repo_name="thunderbump/afk-task",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-preflight.2",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "PATH": f"{fake_gh_bin}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_GH_ALLOWED_REPOS": "thunderbump/afk-task",
+                    "FAKE_BD_LOG": str(bd_log),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            gh_calls = json.loads(gh_log.read_text(encoding="utf-8"))
+            self.assertEqual(
+                gh_calls[1],
+                ["repo", "view", "thunderbump/afk-task", "--json", "nameWithOwner"],
+            )
+            execution_request = json.loads(
+                next(state_dir.glob("runs/*/execution-request.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(execution_request["target_repo"], "thunderbump/afk-task")
+            self.assertEqual(
+                execution_request["target_repo_resolution"]["source"],
+                "metadata",
+            )
+
+    def test_close_preflight_fails_when_origin_remote_is_missing(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            self.write_fake_case(fake_case)
+            beads_workspace = tmp_path / "beads"
+            password_file = self.write_fake_beads_workspace(beads_workspace)
+            fake_bd = tmp_path / "fake-bd"
+            self.write_fake_bd(fake_bd)
+            fake_gh_bin = tmp_path / "bin"
+            self.write_fake_gh(fake_gh_bin)
+            gh_log = tmp_path / "gh-log.json"
+            bd_log = tmp_path / "bd-log.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(
+                bead_json,
+                target_repo,
+                "central-preflight.3",
+                target_repo_name="automation-simple-spike",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-preflight.3",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "PATH": f"{fake_gh_bin}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_GH_ALLOWED_REPOS": "thunderbump/afk-task",
+                    "FAKE_BD_LOG": str(bd_log),
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("does not have an origin remote", result.stderr)
+            self.assertIn("add an origin remote that points at GitHub", result.stderr)
+            self.assertFalse(gh_log.exists())
+            self.assertFalse(fake_case.with_suffix(".json").exists())
+            failure = json.loads(
+                next(state_dir.glob("runs/*/github-pr-preflight.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(failure["failure_kind"], "invalid-target-repo-remote")
+
+    def test_close_preflight_fails_when_origin_remote_is_not_github(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.git(
+                target_repo,
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.com/thunderbump/afk-task.git",
+            )
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            self.write_fake_case(fake_case)
+            beads_workspace = tmp_path / "beads"
+            password_file = self.write_fake_beads_workspace(beads_workspace)
+            fake_bd = tmp_path / "fake-bd"
+            self.write_fake_bd(fake_bd)
+            fake_gh_bin = tmp_path / "bin"
+            self.write_fake_gh(fake_gh_bin)
+            gh_log = tmp_path / "gh-log.json"
+            bd_log = tmp_path / "bd-log.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(
+                bead_json,
+                target_repo,
+                "central-preflight.4",
+                target_repo_name="automation-simple-spike",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-preflight.4",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "PATH": f"{fake_gh_bin}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_GH_ALLOWED_REPOS": "thunderbump/afk-task",
+                    "FAKE_BD_LOG": str(bd_log),
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("origin remote is not a GitHub repository", result.stderr)
+            self.assertIn("update the checkout remote", result.stderr)
+            self.assertFalse(gh_log.exists())
+            self.assertFalse(fake_case.with_suffix(".json").exists())
+
+    def test_close_preflight_fails_when_canonical_metadata_mismatches_remote(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.git(
+                target_repo,
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:thunderbump/afk-task.git",
+            )
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            self.write_fake_case(fake_case)
+            beads_workspace = tmp_path / "beads"
+            password_file = self.write_fake_beads_workspace(beads_workspace)
+            fake_bd = tmp_path / "fake-bd"
+            self.write_fake_bd(fake_bd)
+            fake_gh_bin = tmp_path / "bin"
+            self.write_fake_gh(fake_gh_bin)
+            gh_log = tmp_path / "gh-log.json"
+            bd_log = tmp_path / "bd-log.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(
+                bead_json,
+                target_repo,
+                "central-preflight.5",
+                target_repo_name="other-owner/afk-task",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-preflight.5",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "PATH": f"{fake_gh_bin}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_GH_ALLOWED_REPOS": "thunderbump/afk-task",
+                    "FAKE_BD_LOG": str(bd_log),
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(
+                "metadata target_repo='other-owner/afk-task' does not match",
+                result.stderr,
+            )
+            self.assertIn("update Beads target_repo", result.stderr)
+            self.assertFalse(gh_log.exists())
+            self.assertFalse(fake_case.with_suffix(".json").exists())
+
+    def test_worker_validation_metadata_emits_executable_case_check_command(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            target_commit = self.init_target_repo(target_repo)
+            relative_state_dir = (
+                Path(".automation-simple")
+                / f"worker validation {uuid4().hex}"
+            )
+            state_dir = REPO_ROOT / relative_state_dir
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd()}) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            worker_module = tmp_path / "fake_validation_worker.py"
+            worker_module.write_text(
+                "\n".join(
+                    [
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "request_path = Path(sys.argv[sys.argv.index('--request') + 1])",
+                        "payload = json.loads(request_path.read_text(encoding='utf-8'))",
+                        "evidence_dir = Path(payload['evidence_dir'])",
+                        "evidence_dir.mkdir(parents=True, exist_ok=True)",
+                        "result_path = evidence_dir / 'result.json'",
+                        "result_path.write_text(json.dumps({'status': 'passed'}) + '\\n', encoding='utf-8')",
+                        "Path(os.environ['FAKE_WORKER_RECORD']).write_text(json.dumps({",
+                        "    'argv': sys.argv[1:],",
+                        "    'cwd': os.getcwd(),",
+                        "    'request_path': str(request_path),",
+                        "    'payload': payload,",
+                        "}, sort_keys=True) + '\\n', encoding='utf-8')",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bead_json = tmp_path / "bead.json"
+            bead_json.write_text(
+                json.dumps(
+                    {
+                        "id": "central-run.worker",
+                        "title": "Run worker validation",
+                        "description": "Compile worker-backed validation.",
+                        "status": "open",
+                        "labels": ["project:automation", "ready-for-agent"],
+                        "metadata": {
+                            "afk_enabled": True,
+                            "afk_runner": "codex",
+                            "target_repo": "local/test",
+                            "target_repo_path": str(target_repo),
+                            "target_base_branch": "main",
+                            "branch_policy": "independent",
+                            "validation_mode": "worker",
+                            "validation_worker": {
+                                "worker_command": "python3 -m fake_validation_worker",
+                                "profile": "safe",
+                                "timeout_seconds": 900,
+                                "repo": "local/test",
+                                "ref": "refs/heads/main",
+                                "commit": target_commit,
+                                "evidence_dir": "artifacts/validation",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            record_path = tmp_path / "worker-record.json"
+
+            try:
+                result = run_cli(
+                    "run",
+                    "--bead",
+                    "central-run.worker",
+                    "--bead-json",
+                    str(bead_json),
+                    "--state-dir",
+                    str(relative_state_dir),
+                    "--case-checkout",
+                    str(case_checkout),
+                    "--case-command",
+                    str(fake_case),
+                )
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                request_path = (
+                    state_dir
+                    / "validation-requests"
+                    / "central-run.worker.json"
+                )
+                validation_request = json.loads(
+                    request_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(validation_request["mode"], "worker")
+                self.assertEqual(validation_request["profile"], "safe")
+                self.assertEqual(validation_request["timeout_seconds"], 900)
+                self.assertEqual(validation_request["repo"], "local/test")
+                self.assertEqual(validation_request["ref"], "refs/heads/main")
+                self.assertEqual(validation_request["commit"], target_commit)
+                evidence_dir = Path(validation_request["evidence_dir"])
+                self.assertTrue(evidence_dir.is_absolute())
+                self.assertTrue(evidence_dir.is_dir())
+                self.assertEqual(evidence_dir.name, "validation-evidence")
+                self.assertEqual(evidence_dir.parent.parent, state_dir / "runs")
+                self.assertEqual(
+                    validation_request["review_branch"],
+                    "agent/central-run.worker",
+                )
+
+                expected_command = (
+                    "python3 -m fake_validation_worker --request "
+                    f"{shlex.quote(str(request_path))}"
+                )
+                task_json_path = (
+                    target_repo
+                    / ".case"
+                    / "tasks"
+                    / "active"
+                    / "central-run.worker.task.json"
+                )
+                task_md_path = (
+                    target_repo
+                    / ".case"
+                    / "tasks"
+                    / "active"
+                    / "central-run.worker.md"
+                )
+                task_json = json.loads(task_json_path.read_text(encoding="utf-8"))
+                self.assertEqual(task_json["checkCommand"], expected_command)
+                self.assertNotIn("validation_worker", task_json)
+                task_markdown = task_md_path.read_text(encoding="utf-8")
+                self.assertIn(f"- Validation command: {expected_command}", task_markdown)
+                self.assertIn(f"Run `{expected_command}`", task_markdown)
+
+                project_manifest = json.loads(
+                    (state_dir / "case-data" / "projects.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                commands = project_manifest["repos"][0]["commands"]
+                self.assertEqual(commands["test"], expected_command)
+                self.assertEqual(commands["check"], expected_command)
+
+                execution_requests = list(
+                    (state_dir / "runs").glob("*/execution-request.json")
+                )
+                self.assertEqual(len(execution_requests), 1)
+                execution_request = json.loads(
+                    execution_requests[0].read_text(encoding="utf-8")
+                )
+                worker_execution = execution_request["validation_worker"]
+                self.assertEqual(worker_execution["request_path"], str(request_path))
+                self.assertEqual(
+                    worker_execution["generated_command"],
+                    expected_command,
+                )
+                self.assertEqual(worker_execution["evidence_dir"], str(evidence_dir))
+                self.assertEqual(worker_execution["profile"], "safe")
+                self.assertEqual(worker_execution["timeout_seconds"], 900)
+                self.assertEqual(worker_execution["ref"], "refs/heads/main")
+                self.assertEqual(worker_execution["commit"], target_commit)
+
+                worker_result = subprocess.run(
+                    task_json["checkCommand"],
+                    cwd=target_repo,
+                    env={
+                        **os.environ,
+                        "PYTHONPATH": str(tmp_path),
+                        "FAKE_WORKER_RECORD": str(record_path),
+                    },
+                    shell=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+                self.assertEqual(
+                    worker_result.returncode,
+                    0,
+                    worker_result.stdout + worker_result.stderr,
+                )
+                worker_record = json.loads(record_path.read_text(encoding="utf-8"))
+                self.assertEqual(worker_record["cwd"], str(target_repo))
+                self.assertEqual(
+                    Path(worker_record["request_path"]).resolve(),
+                    request_path.resolve(),
+                )
+                self.assertEqual(worker_record["payload"], validation_request)
+                self.assertEqual(
+                    json.loads(
+                        (evidence_dir / "result.json").read_text(encoding="utf-8")
+                    ),
+                    {"status": "passed"},
+                )
+                self.assertFalse((target_repo / "artifacts" / "validation").exists())
+            finally:
+                shutil.rmtree(state_dir, ignore_errors=True)
+
+    def test_generated_task_marks_current_case_task_active_for_phase_agents(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "record_path = Path(os.environ['FAKE_CASE_RECORD'])",
+                        "command = sys.argv[2] if len(sys.argv) > 2 else None",
+                        "records = json.loads(record_path.read_text(encoding='utf-8')) if record_path.exists() else {}",
+                        "if command == 'run':",
+                        "    records['run'] = {'argv': sys.argv[1:], 'cwd': os.getcwd()}",
+                        "elif command in {'mark-tested', 'mark-reviewed'}:",
+                        "    active_path = Path.cwd() / '.case' / 'active'",
+                        "    if not active_path.is_file():",
+                        "        print('missing .case/active', file=sys.stderr)",
+                        "        sys.exit(33)",
+                        "    records[command] = {",
+                        "        'active': active_path.read_text(encoding='utf-8').strip(),",
+                        "        'argv': sys.argv[1:],",
+                        "        'cwd': os.getcwd(),",
+                        "    }",
+                        "else:",
+                        "    records.setdefault('other', []).append({'argv': sys.argv[1:], 'cwd': os.getcwd()})",
+                        "record_path.write_text(json.dumps(records, sort_keys=True) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            record_path = tmp_path / "case-record.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.13")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.13",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                env={"FAKE_CASE_RECORD": str(record_path)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            active_path = target_repo / ".case" / "active"
+            self.assertTrue(active_path.is_file())
+            self.assertEqual(active_path.read_text(encoding="utf-8"), "central-run.13\n")
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            for command in ("mark-tested", "mark-reviewed"):
+                with self.subTest(command=command):
+                    shim_result = subprocess.run(
+                        [str(case_cli_shim), command],
+                        cwd=target_repo,
+                        env={
+                            "PATH": f"{case_cli_shim.parent}{os.pathsep}{os.defpath}",
+                            "FAKE_CASE_RECORD": str(record_path),
+                        },
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        shim_result.returncode,
+                        0,
+                        shim_result.stdout + shim_result.stderr,
+                    )
+
+            case_record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(case_record["mark-tested"]["active"], "central-run.13")
+            self.assertEqual(case_record["mark-reviewed"]["active"], "central-run.13")
+            self.assertEqual(case_record["mark-tested"]["cwd"], str(target_repo))
+            self.assertEqual(case_record["mark-reviewed"]["cwd"], str(target_repo))
 
     def test_case_checkout_can_come_from_environment(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -400,6 +1165,56 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertIn("pass --case-checkout", result.stderr)
             self.assertIn("CASE_CHECKOUT", result.stderr)
             self.assertFalse(fake_case.with_suffix(".json").exists())
+            self.assertFalse((target_repo / ".case").exists())
+            self.assertFalse(state_dir.exists())
+
+    def test_missing_case_command_configuration_stops_before_case_state(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            home_dir = tmp_path / "home"
+            home_bun_dir = home_dir / ".bun" / "bin"
+            home_bun_dir.mkdir(parents=True)
+            home_bun = home_bun_dir / "bun"
+            home_bun.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "from pathlib import Path",
+                        "Path(__file__).with_suffix('.json').write_text('ran\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            home_bun.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.13")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.13",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                "definitely-missing-case-command",
+                env={"HOME": str(home_dir), "PATH": os.defpath},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("run-bead missing Case command", result.stderr)
+            self.assertIn("definitely-missing-case-command", result.stderr)
+            self.assertIn("--case-command /path/to/bun", result.stderr)
+            self.assertIn("add Bun to PATH", result.stderr)
+            self.assertFalse(home_bun.with_suffix(".json").exists())
             self.assertFalse((target_repo / ".case").exists())
             self.assertFalse(state_dir.exists())
 
@@ -587,9 +1402,168 @@ class RunBeadCliTest(unittest.TestCase):
                 self.assertFalse(fake_case.with_suffix(".json").exists())
                 self.assertFalse((target_repo / ".case").exists())
 
-    def test_case_cli_shim_preserves_agent_cwd_and_uses_absolute_case_entrypoint(
+    def test_case_cli_shim_uses_explicit_case_command_with_restricted_path(
         self,
     ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "record_path = os.environ.get('FAKE_CASE_RECORD')",
+                        "if record_path:",
+                        "    Path(record_path).write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "  'cwd': os.getcwd(),",
+                        "    }) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            record_path = tmp_path / "case-record.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.9")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.9",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            shim_result = subprocess.run(
+                [
+                    str(case_cli_shim),
+                    "status",
+                    ".case/tasks/active/central-run.9.task.json",
+                ],
+                cwd=target_repo,
+                env={
+                    "PATH": f"{case_cli_shim.parent}{os.pathsep}{os.defpath}",
+                    "FAKE_CASE_RECORD": str(record_path),
+                },
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(
+                shim_result.returncode, 0, shim_result.stdout + shim_result.stderr
+            )
+            case_record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(case_record["cwd"], str(target_repo))
+            self.assertEqual(
+                case_record["argv"],
+                [
+                    str(case_checkout / "src" / "index.ts"),
+                    "status",
+                    ".case/tasks/active/central-run.9.task.json",
+                ],
+            )
+
+    def test_case_cli_shim_uses_path_resolved_case_command_with_restricted_path(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            fake_case = fake_bin / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "record_path = os.environ.get('FAKE_CASE_RECORD')",
+                        "if record_path:",
+                        "    Path(record_path).write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "  'cwd': os.getcwd(),",
+                        "    }) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            record_path = tmp_path / "case-record.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.12")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.12",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                "fake-case",
+                env={"PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            shim_result = subprocess.run(
+                [
+                    str(case_cli_shim),
+                    "status",
+                    ".case/tasks/active/central-run.12.task.json",
+                ],
+                cwd=target_repo,
+                env={
+                    "PATH": f"{case_cli_shim.parent}{os.pathsep}{os.defpath}",
+                    "FAKE_CASE_RECORD": str(record_path),
+                },
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(
+                shim_result.returncode, 0, shim_result.stdout + shim_result.stderr
+            )
+            case_record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(case_record["cwd"], str(target_repo))
+            self.assertEqual(
+                case_record["argv"],
+                [
+                    str(case_checkout / "src" / "index.ts"),
+                    "status",
+                    ".case/tasks/active/central-run.12.task.json",
+                ],
+            )
+
+    def test_default_case_command_uses_bun_from_path(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
@@ -606,7 +1580,7 @@ class RunBeadCliTest(unittest.TestCase):
                         "#!/usr/bin/env python3",
                         "import json, os, sys",
                         "from pathlib import Path",
-                        "Path(os.environ['FAKE_BUN_RECORD']).write_text(json.dumps({",
+                        "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
                         "  'argv': sys.argv[1:],",
                         "  'cwd': os.getcwd(),",
                         "}) + '\\n', encoding='utf-8')",
@@ -615,56 +1589,121 @@ class RunBeadCliTest(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_bun.chmod(0o755)
-            record_path = tmp_path / "bun-record.json"
             bead_json = tmp_path / "bead.json"
-            self.write_eligible_bead(bead_json, target_repo, "central-run.9")
+            self.write_eligible_bead(bead_json, target_repo, "central-run.15")
 
             result = run_cli(
                 "run",
                 "--bead",
-                "central-run.9",
+                "central-run.15",
                 "--bead-json",
                 str(bead_json),
                 "--state-dir",
                 str(state_dir),
                 "--case-checkout",
                 str(case_checkout),
-                "--case-command",
-                "true",
+                env={"PATH": f"{fake_bin}{os.pathsep}{os.defpath}"},
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            case_cli_shim = state_dir / "case-bin" / "ca"
-            shim_result = subprocess.run(
+            fake_bun_record = json.loads(
+                fake_bun.with_suffix(".json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(fake_bun_record["cwd"], str(case_checkout))
+            self.assertEqual(
+                fake_bun_record["argv"],
                 [
-                    str(case_cli_shim),
-                    "status",
-                    ".case/tasks/active/central-run.9.task.json",
+                    "src/index.ts",
+                    "run",
+                    "--task",
+                    str(
+                        target_repo
+                        / ".case"
+                        / "tasks"
+                        / "active"
+                        / "central-run.15.task.json"
+                    ),
+                    "--mode",
+                    "unattended",
                 ],
-                cwd=target_repo,
-                env={
-                    **os.environ,
-                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
-                    "FAKE_BUN_RECORD": str(record_path),
-                },
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
+            )
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            self.assertIn(
+                f"CASE_COMMAND={fake_bun}",
+                case_cli_shim.read_text(encoding="utf-8"),
             )
 
-            self.assertEqual(
-                shim_result.returncode, 0, shim_result.stdout + shim_result.stderr
+    def test_default_case_command_uses_home_bun_when_bun_is_outside_path(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            home_dir = tmp_path / "home"
+            home_bun_dir = home_dir / ".bun" / "bin"
+            home_bun_dir.mkdir(parents=True)
+            fake_bun = home_bun_dir / "bun"
+            fake_bun.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
+                        "  'argv': sys.argv[1:],",
+                        "  'cwd': os.getcwd(),",
+                        "}) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
             )
-            bun_record = json.loads(record_path.read_text(encoding="utf-8"))
-            self.assertEqual(bun_record["cwd"], str(target_repo))
+            fake_bun.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.14")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.14",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                env={"HOME": str(home_dir), "PATH": os.defpath},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            fake_bun_record = json.loads(
+                fake_bun.with_suffix(".json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(fake_bun_record["cwd"], str(case_checkout))
             self.assertEqual(
-                bun_record["argv"],
+                fake_bun_record["argv"],
                 [
-                    str(case_checkout / "src" / "index.ts"),
-                    "status",
-                    ".case/tasks/active/central-run.9.task.json",
+                    "src/index.ts",
+                    "run",
+                    "--task",
+                    str(
+                        target_repo
+                        / ".case"
+                        / "tasks"
+                        / "active"
+                        / "central-run.14.task.json"
+                    ),
+                    "--mode",
+                    "unattended",
                 ],
+            )
+            case_cli_shim = state_dir / "case-bin" / "ca"
+            self.assertIn(
+                f"CASE_COMMAND={fake_bun}",
+                case_cli_shim.read_text(encoding="utf-8"),
             )
 
     def test_case_codex_session_writes_wrapper_config_and_injects_child_env_only(

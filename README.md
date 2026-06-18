@@ -126,6 +126,20 @@ finishes. It does not treat `human_gates`, `environment_gates`,
 appear as task context, but they do not block an otherwise runnable AFK bead or
 add approval evidence to `execution-request.json`.
 
+To continue a `shared-sequential` workstream from an existing branch, ref, or
+GitHub PR URL before that work has merged to the target base branch, seed only
+the first shared branch setup:
+
+```sh
+python3 -m automation_simple_workflow run-workstream \
+  --workstream-id <workstream-id> \
+  --workstream-seed-ref agent/<prior-branch>
+```
+
+The generated review branch is still `agent/<workstream_id>`. Execution request
+artifacts for the seeded setup record `workstream_seed_ref`,
+`workstream_seed_commit`, and the resulting `review_branch`.
+
 Model live or HITL work in Beads instead. Move that work to `ready-for-human`,
 leave/open a blocking dependency, or create a blocked follow-up bead with the
 same `project:<slug>` ownership label. Once the human-attended work is resolved,
@@ -174,6 +188,23 @@ Lifecycle mode sets `active_run_*` metadata before Case starts, records
 `last_afk_run_*` result metadata after Case exits, comments failure evidence,
 clears active metadata, and can close the bead on success. Beads credentials are
 kept in the `bd` subprocess environment and are removed before invoking Case.
+
+When `--close-bead-on-success` is set, the workflow treats the unattended Case
+close as a GitHub PR close. Before it starts Case, it verifies that `gh` is on
+the same `PATH` Case will receive, `gh auth status` succeeds under Case's
+isolated `HOME`/`XDG_CONFIG_HOME`, and `gh repo view <target_repo>` can read the
+target repository. A parent shell `gh login` is not enough because native Case
+close does not use the parent `HOME`. `GH_TOKEN` and `GITHUB_TOKEN` are
+intentionally inherited by the Case child environment, so token-based auth is
+the supported unattended path. Token values are redacted from wrapper failure
+details and archived Case output. Failures are reported as missing `gh`,
+unauthenticated `gh`/missing `GH_TOKEN` or `GITHUB_TOKEN`, or missing remote
+permissions. With `--beads-lifecycle`, those preflight failures are recorded as
+`last_afk_run_*` failure metadata and a Beads comment; Case is not started.
+
+There is no separate no-PR/archive-only close mode today. For archive-only
+lifecycle metadata, omit `--close-bead-on-success`; the bead stays open and the
+wrapper does not preflight GitHub PR capability.
 
 To prepare native Case's default Pi transport to use a local Codex ChatGPT
 session token, pass:
@@ -277,7 +308,11 @@ The container image does not currently install or configure `bd`, so central
 Beads runs need either a fixture JSON via `--bead-json` or a later explicit
 Beads workspace/CLI mount. Live Codex-session runs likewise need an explicit
 read-only auth mount plus `--case-codex-session --codex-auth-file <mounted-path>`.
-For `run-workstream`, keep live Codex/container proofs as `ready-for-human` or
+Worker-backed validation does not require mounting the host Docker socket by
+default: the container only generates the portable worker request JSON and Case
+check command. Any AkkStack, Docker, SSH, or job-dispatch access belongs to the
+configured validation worker command/transport outside the Case container. For
+`run-workstream`, keep live Codex/container proofs as `ready-for-human` or
 blocked follow-up work until they are suitable for ordinary AFK execution.
 
 For a no-network synthetic proof, mount a temp directory containing the target
@@ -390,7 +425,9 @@ bun src/index.ts run --task <task-json> --mode unattended
 ```
 
 with `CASE_DATA_DIR`, `XDG_CONFIG_HOME`, and `HOME` pointed at the wrapper-owned
-Case data dir. Beads environment variables are removed before invoking Case.
+Case data dir, `GH_PROMPT_DISABLED=1`, and any parent `GH_TOKEN`/`GITHUB_TOKEN`
+values intentionally inherited for unattended PR creation. Beads environment
+variables are removed before invoking Case.
 Ambient `OPENAI_API_KEY` and `PI_CODING_AGENT_DIR` are also removed unless
 `--case-codex-session` is enabled. In wrapper mode, `PI_CODING_AGENT_DIR` points
 to `.automation-simple/pi-codex` and `OPENAI_API_KEY` is populated only in the
@@ -412,6 +449,34 @@ repo.
 After Case exits, lifecycle mode records success or failure metadata, comments
 actionable failure evidence, clears active metadata, and can close the bead on
 success when `--close-bead-on-success` is set.
+
+### Generated Validation Command Checks
+
+When a bead uses worker-backed validation, the generated Case
+`checkCommand` is command text, not an argv array. Verify it the same way Case
+will execute it: from the target repo cwd with shell semantics. The check should
+run the emitted `checkCommand` itself, not only inspect the task JSON or markdown
+artifact.
+
+Keep coverage for these runtime semantics:
+
+- A multi-word worker command such as `python3 -m fake_validation_worker`
+  remains split by the shell and is not treated as one executable path.
+- Relative wrapper state dirs still produce request paths that resolve from the
+  target repo cwd when the generated command runs.
+- The worker sees the target repo as `cwd` and can read the generated request
+  payload.
+- Metadata with `validation_worker.transport: local` or `remote` compiles
+  through `automation_simple_spike.validation_worker_adapter`, which appends the
+  same `--request` payload to the configured local command or remote dispatch
+  command. The adapter strips Beads, Codex, and Pi secret environment variables,
+  reports missing local commands, remote dispatch failures, worker nonzero exits,
+  timeouts, and missing evidence as distinct `failure_category` values in
+  `validation-evidence/result.json`.
+
+`tests/test_run_bead_cli.py`, `tests/test_validation_metadata.py`, and
+`tests/test_validation_worker_adapter.py` contain the worker-backed fixtures for
+this shape.
 
 ## Cron Shape
 

@@ -14,6 +14,7 @@ from .cli import (
     review_branch_for,
     run_bead,
 )
+from .validation_metadata import WORKER_METADATA_KEYS, is_worker_validation_requested
 from .workstream_context import (
     ENVIRONMENT_GATE_METADATA_KEYS,
     LIKELY_FILE_METADATA_KEYS,
@@ -39,6 +40,7 @@ SAFE_METADATA_KEYS = {
     "validation_command",
     "light_verification_command",
     "workstream_id",
+    *WORKER_METADATA_KEYS,
     *LIKELY_FILE_METADATA_KEYS,
     *ENVIRONMENT_GATE_METADATA_KEYS,
 }
@@ -57,10 +59,11 @@ def run_workstream_command(
     parent_id: str | None,
     workstream_id: str | None,
     workstream_json: Path | None,
+    workstream_seed_ref: str | None,
     state_dir: Path,
     case_checkout: Path | None,
     case_data_dir: Path | None,
-    case_command: str,
+    case_command: str | None,
     case_dry_run: bool,
     case_runtime_module: Path | None,
     target_checkout_mode: str,
@@ -93,6 +96,7 @@ def run_workstream_command(
         issues,
         parent_id=parent_id,
         workstream_id=workstream_id,
+        workstream_seed_ref=workstream_seed_ref,
         state_dir=state_dir,
         case_checkout=case_checkout,
         case_data_dir=case_data_dir,
@@ -154,10 +158,11 @@ def run_workstream_issues(
     *,
     parent_id: str | None,
     workstream_id: str | None,
+    workstream_seed_ref: str | None,
     state_dir: Path,
     case_checkout: Path | None,
     case_data_dir: Path | None,
-    case_command: str,
+    case_command: str | None,
     case_dry_run: bool,
     case_runtime_module: Path | None,
     target_checkout_mode: str,
@@ -197,6 +202,11 @@ def run_workstream_issues(
 
             issue = runnable[0]
             issue_id = str(issue["id"])
+            workstream_seed_ref_for_run = (
+                workstream_seed_ref
+                if shared_checkout is None and uses_shared_sequential_branch(issue)
+                else None
+            )
             issue_for_run = issue_with_shared_checkout(
                 issue,
                 shared_checkout=shared_checkout,
@@ -257,6 +267,7 @@ def run_workstream_issues(
                 beads_lifecycle=beads_lifecycle,
                 close_bead_on_success=close_bead_on_success,
                 skip_target_preparation=skip_target_preparation,
+                workstream_seed_ref=workstream_seed_ref_for_run,
             )
             if result != 0:
                 print(
@@ -270,7 +281,10 @@ def run_workstream_issues(
             if uses_shared_sequential_branch(issue):
                 shared_checkout = target_checkout
             final_validation_cwd = target_checkout
-            final_validation_command = str(issue["metadata"]["validation_command"])
+            final_validation_command = validation_command_from_request(
+                request,
+                issue_for_run,
+            )
 
             light_result = run_light_verification(
                 issue=issue,
@@ -453,6 +467,21 @@ def target_checkout_from_request(
         if isinstance(checkout, str) and checkout:
             return Path(checkout)
     return Path(str(issue["metadata"]["target_repo_path"])).resolve()
+
+
+def validation_command_from_request(
+    request: Path | None,
+    issue: dict[str, Any],
+) -> str:
+    metadata = issue.get("metadata") or {}
+    if not is_worker_validation_requested(metadata):
+        return str(metadata["validation_command"])
+    if request is not None:
+        payload = json.loads(request.read_text(encoding="utf-8"))
+        command = payload.get("validation_command")
+        if isinstance(command, str) and command:
+            return command
+    return str(metadata["validation_command"])
 
 
 def mark_issue_closed(issues: list[dict[str, Any]], issue_id: str) -> None:

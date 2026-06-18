@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -15,6 +17,7 @@ from automation_simple_spike.beads_lifecycle import (
     BeadsLifecycleClient,
     LifecycleRun,
 )
+from automation_simple_spike.cli import lifecycle_run_with_validation_result
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +58,9 @@ class BeadsLifecycleTest(unittest.TestCase):
         self.git(path, "commit", "-m", "Initial target commit")
         self.git(path, "branch", "-M", "main")
         return self.git(path, "rev-parse", "main").stdout.strip()
+
+    def add_matching_github_origin(self, path: Path) -> None:
+        self.git(path, "remote", "add", "origin", "git@github.com:local/test.git")
 
     def write_eligible_bead(self, path: Path, target_repo: Path, bead_id: str) -> None:
         path.write_text(
@@ -119,6 +125,102 @@ class BeadsLifecycleTest(unittest.TestCase):
         )
         fake_case.chmod(0o755)
         return fake_case
+
+    def fake_gh(
+        self,
+        path: Path,
+        *,
+        auth_exit_code: int = 0,
+        repo_exit_code: int = 0,
+        auth_stderr: str = "",
+        repo_stderr: str = "",
+    ) -> tuple[Path, Path]:
+        fake_bin = path / "bin"
+        fake_bin.mkdir(exist_ok=True)
+        transcript_path = path / "gh-transcript.json"
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, os, sys",
+                    "from pathlib import Path",
+                    f"auth_exit_code = {auth_exit_code}",
+                    f"repo_exit_code = {repo_exit_code}",
+                    f"auth_stderr = {auth_stderr!r}",
+                    f"repo_stderr = {repo_stderr!r}",
+                    "transcript_path = Path(os.environ['FAKE_GH_TRANSCRIPT'])",
+                    "transcript = json.loads(transcript_path.read_text(encoding='utf-8')) if transcript_path.exists() else []",
+                    "transcript.append({'argv': sys.argv[1:]})",
+                    "transcript_path.write_text(json.dumps(transcript, indent=2) + '\\n', encoding='utf-8')",
+                    "if sys.argv[1:3] == ['auth', 'status']:",
+                    "    print(auth_stderr, file=sys.stderr)",
+                    "    raise SystemExit(auth_exit_code)",
+                    "if sys.argv[1:3] == ['repo', 'view']:",
+                    "    print(repo_stderr, file=sys.stderr)",
+                    "    raise SystemExit(repo_exit_code)",
+                    "raise SystemExit(99)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+        return fake_bin, transcript_path
+
+    def fake_gh_with_case_env_expectations(
+        self,
+        path: Path,
+        *,
+        parent_home: Path | None = None,
+        required_token: str | None = None,
+        repo_exit_code: int = 0,
+        repo_stderr: str = "",
+    ) -> tuple[Path, Path]:
+        fake_bin = path / "bin"
+        fake_bin.mkdir(exist_ok=True)
+        transcript_path = path / "gh-transcript.json"
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, os, sys",
+                    "from pathlib import Path",
+                    f"parent_home = {str(parent_home) if parent_home is not None else None!r}",
+                    f"required_token = {required_token!r}",
+                    f"repo_exit_code = {repo_exit_code}",
+                    f"repo_stderr = {repo_stderr!r}",
+                    "transcript_path = Path(os.environ['FAKE_GH_TRANSCRIPT'])",
+                    "transcript = json.loads(transcript_path.read_text(encoding='utf-8')) if transcript_path.exists() else []",
+                    "token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')",
+                    "transcript.append({",
+                    "  'argv': sys.argv[1:],",
+                    "  'home': os.environ.get('HOME'),",
+                    "  'xdg_config_home': os.environ.get('XDG_CONFIG_HOME'),",
+                    "  'path_entries': os.environ.get('PATH', '').split(os.pathsep)[:2],",
+                    "  'token_present': bool(token),",
+                    "})",
+                    "transcript_path.write_text(json.dumps(transcript, indent=2) + '\\n', encoding='utf-8')",
+                    "if sys.argv[1:3] == ['auth', 'status']:",
+                    "    if required_token is not None:",
+                    "        if token == required_token:",
+                    "            raise SystemExit(0)",
+                    "        print('no usable token in case environment', file=sys.stderr)",
+                    "        raise SystemExit(1)",
+                    "    if parent_home is not None and os.environ.get('HOME') == parent_home:",
+                    "        raise SystemExit(0)",
+                    "    print('isolated case home has no gh auth', file=sys.stderr)",
+                    "    raise SystemExit(1)",
+                    "if sys.argv[1:3] == ['repo', 'view']:",
+                    "    print(repo_stderr, file=sys.stderr)",
+                    "    raise SystemExit(repo_exit_code)",
+                    "raise SystemExit(99)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+        return fake_bin, transcript_path
 
     def client(self, tmp_path: Path) -> tuple[BeadsLifecycleClient, Path, str]:
         beads_workspace = tmp_path / "beads"
@@ -301,6 +403,39 @@ class BeadsLifecycleTest(unittest.TestCase):
                 transcript_path.read_text(encoding="utf-8"),
             )
 
+    def test_run_success_records_validation_worker_evidence_result(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            client, transcript_path, _secret_value = self.client(tmp_path)
+            evidence_dir = (
+                tmp_path
+                / ".automation-simple"
+                / "runs"
+                / "run-123"
+                / "validation-evidence"
+            )
+            run = replace(
+                self.run_state(tmp_path),
+                validation_evidence_path=evidence_dir,
+                validation_worker_status="passed",
+            )
+
+            with self.transcript_env(transcript_path):
+                client.record_success(
+                    run,
+                    commit_sha="abc123def456",
+                    interpreted_exit_code=0,
+                    close_bead=False,
+                )
+
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+            metadata = self.metadata_from_update(transcript[0]["argv"])
+            self.assertEqual(
+                metadata["last_afk_validation_evidence_path"],
+                str(evidence_dir),
+            )
+            self.assertEqual(metadata["last_afk_validation_worker_status"], "passed")
+
     def test_run_failure_comments_and_clears_active_state(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -366,11 +501,529 @@ class BeadsLifecycleTest(unittest.TestCase):
             transcript_text = transcript_path.read_text(encoding="utf-8")
             self.assertNotIn(secret_value, transcript_text)
 
+    def test_run_failure_comments_validation_worker_status_and_evidence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            client, transcript_path, _secret_value = self.client(tmp_path)
+            evidence_dir = (
+                tmp_path
+                / ".automation-simple"
+                / "runs"
+                / "run-123"
+                / "validation-evidence"
+            )
+            run = replace(
+                self.run_state(tmp_path),
+                validation_evidence_path=evidence_dir,
+                validation_worker_status="failed",
+                validation_failure_category="harness_timeout",
+            )
+
+            with self.transcript_env(transcript_path):
+                client.record_failure(
+                    run,
+                    interpreted_exit_code=1,
+                    failure_summary="Case command exited 1",
+                )
+
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+            self.assertIn("Validation worker status: failed", transcript[0]["stdin"])
+            self.assertIn(
+                "Validation failure category: harness_timeout", transcript[0]["stdin"]
+            )
+            self.assertIn(f"Validation evidence: {evidence_dir}", transcript[0]["stdin"])
+            metadata = self.metadata_from_update(transcript[1]["argv"])
+            self.assertEqual(
+                metadata["last_afk_validation_evidence_path"],
+                str(evidence_dir),
+            )
+            self.assertEqual(metadata["last_afk_validation_worker_status"], "failed")
+            self.assertEqual(
+                metadata["last_afk_validation_failure_category"],
+                "harness_timeout",
+            )
+
+    def test_missing_validation_worker_result_is_summarized(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            evidence_dir = tmp_path / "validation-evidence"
+            evidence_dir.mkdir()
+            run = replace(
+                self.run_state(tmp_path),
+                validation_evidence_path=evidence_dir,
+            )
+
+            summarized = lifecycle_run_with_validation_result(run)
+
+            self.assertEqual(summarized.validation_worker_status, "missing_result")
+            self.assertEqual(summarized.validation_evidence_path, evidence_dir)
+
+    def test_validation_worker_result_is_summarized_without_logs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            evidence_dir = tmp_path / "validation-evidence"
+            evidence_dir.mkdir()
+            (evidence_dir / "result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "failure_category": "harness_timeout",
+                        "logs": "large logs should stay in the artifact only",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            run = replace(
+                self.run_state(tmp_path),
+                validation_evidence_path=evidence_dir,
+            )
+
+            summarized = lifecycle_run_with_validation_result(run)
+
+            self.assertEqual(summarized.validation_worker_status, "failed")
+            self.assertEqual(
+                summarized.validation_failure_category,
+                "harness_timeout",
+            )
+
+    def test_cli_lifecycle_close_preflight_records_failure_before_case_when_gh_is_unauthed(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            case_marker = tmp_path / "case-ran"
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "from pathlib import Path",
+                        f"Path({str(case_marker)!r}).write_text('ran\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-life.3")
+            client, transcript_path, secret_value = self.client(tmp_path)
+            fake_bin, gh_transcript_path = self.fake_gh(
+                tmp_path,
+                auth_exit_code=1,
+                auth_stderr="not logged into github.com",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-life.3",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--bd-command",
+                client.bd_command,
+                "--beads-workspace",
+                str(client.beads_workspace),
+                "--beads-password-file",
+                str(client.beads_password_file),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                env={
+                    "FAKE_BD_TRANSCRIPT": str(transcript_path),
+                    "FAKE_GH_TRANSCRIPT": str(gh_transcript_path),
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("run-bead GitHub PR preflight failed", result.stderr)
+            self.assertIn("unauthenticated gh", result.stderr)
+            self.assertIn("GH_TOKEN", result.stderr)
+            self.assertFalse(case_marker.exists())
+            self.assertFalse((target_repo / ".case").exists())
+            gh_transcript = json.loads(gh_transcript_path.read_text(encoding="utf-8"))
+            self.assertEqual(gh_transcript, [{"argv": ["auth", "status"]}])
+
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(transcript), 2)
+            self.assertEqual(
+                transcript[0]["argv"],
+                ["comment", "central-life.3", "--stdin"],
+            )
+            self.assertIn("GitHub PR preflight failed", transcript[0]["stdin"])
+            self.assertIn("Case was not started", transcript[0]["stdin"])
+            failure_metadata = self.metadata_from_update(transcript[1]["argv"])
+            self.assertEqual(failure_metadata["last_afk_run_result"], "failure")
+            self.assertEqual(failure_metadata["last_afk_run_exit_code"], "1")
+            self.assertTrue(
+                failure_metadata["last_afk_run_id"].startswith(
+                    "run-bead-central-life.3-"
+                )
+            )
+            preflight_record = json.loads(
+                (
+                    Path(failure_metadata["last_afk_run_archive_path"])
+                    / "github-pr-preflight.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(preflight_record["failure_kind"], "unauthenticated-gh")
+            self.assertFalse(preflight_record["ok"])
+            self.assertIn(
+                "active_run_id",
+                self.unset_metadata_from_update(transcript[1]["argv"]),
+            )
+            self.assertNotIn(secret_value, transcript_path.read_text(encoding="utf-8"))
+
+    def test_cli_lifecycle_close_preflight_uses_case_home_not_parent_gh_auth(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            parent_home = tmp_path / "parent-home"
+            parent_home.mkdir()
+            case_marker = tmp_path / "case-ran"
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "from pathlib import Path",
+                        f"Path({str(case_marker)!r}).write_text('ran\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-life.6")
+            client, transcript_path, _secret_value = self.client(tmp_path)
+            fake_bin, gh_transcript_path = self.fake_gh_with_case_env_expectations(
+                tmp_path,
+                parent_home=parent_home,
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-life.6",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--bd-command",
+                client.bd_command,
+                "--beads-workspace",
+                str(client.beads_workspace),
+                "--beads-password-file",
+                str(client.beads_password_file),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                env={
+                    "FAKE_BD_TRANSCRIPT": str(transcript_path),
+                    "FAKE_GH_TRANSCRIPT": str(gh_transcript_path),
+                    "HOME": str(parent_home),
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("isolated case home has no gh auth", result.stderr)
+            self.assertFalse(case_marker.exists())
+            self.assertFalse((target_repo / ".case").exists())
+            gh_transcript = json.loads(gh_transcript_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(gh_transcript), 1)
+            self.assertEqual(gh_transcript[0]["argv"], ["auth", "status"])
+            self.assertEqual(
+                gh_transcript[0]["home"],
+                str(state_dir / "case-data" / "home"),
+            )
+            self.assertEqual(
+                gh_transcript[0]["xdg_config_home"],
+                str(state_dir / "case-data" / "config-home"),
+            )
+            self.assertEqual(
+                gh_transcript[0]["path_entries"][0],
+                str(state_dir / "case-bin"),
+            )
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+            self.assertIn("GitHub PR preflight failed", transcript[0]["stdin"])
+            failure_metadata = self.metadata_from_update(transcript[1]["argv"])
+            self.assertEqual(failure_metadata["last_afk_run_result"], "failure")
+
+    def test_cli_lifecycle_close_preflight_allows_explicit_github_token_in_case_env(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            commit_sha = self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            parent_home = tmp_path / "parent-home"
+            parent_home.mkdir()
+            case_env_record = tmp_path / "case-env.json"
+            token_value = f"ghp_{uuid4().hex}"
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os",
+                        "from pathlib import Path",
+                        "Path(os.environ['CASE_ENV_RECORD']).write_text(json.dumps({",
+                        "  'gh_token_present': bool(os.environ.get('GH_TOKEN')),",
+                        "  'github_token_present': bool(os.environ.get('GITHUB_TOKEN')),",
+                        "  'home': os.environ.get('HOME'),",
+                        "  'xdg_config_home': os.environ.get('XDG_CONFIG_HOME'),",
+                        "  'path_entries': os.environ.get('PATH', '').split(os.pathsep)[:2],",
+                        "}, indent=2) + '\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-life.7")
+            client, transcript_path, secret_value = self.client(tmp_path)
+            fake_bin, gh_transcript_path = self.fake_gh_with_case_env_expectations(
+                tmp_path,
+                required_token=token_value,
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-life.7",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--bd-command",
+                client.bd_command,
+                "--beads-workspace",
+                str(client.beads_workspace),
+                "--beads-password-file",
+                str(client.beads_password_file),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                env={
+                    "CASE_ENV_RECORD": str(case_env_record),
+                    "FAKE_BD_TRANSCRIPT": str(transcript_path),
+                    "FAKE_GH_TRANSCRIPT": str(gh_transcript_path),
+                    "GH_TOKEN": token_value,
+                    "HOME": str(parent_home),
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            gh_transcript = json.loads(gh_transcript_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [entry["argv"] for entry in gh_transcript],
+                [
+                    ["auth", "status"],
+                    ["repo", "view", "local/test", "--json", "nameWithOwner"],
+                ],
+            )
+            self.assertTrue(all(entry["token_present"] for entry in gh_transcript))
+            self.assertEqual(
+                gh_transcript[0]["home"],
+                str(state_dir / "case-data" / "home"),
+            )
+            case_env = json.loads(case_env_record.read_text(encoding="utf-8"))
+            self.assertTrue(case_env["gh_token_present"])
+            self.assertFalse(case_env["github_token_present"])
+            self.assertEqual(case_env["home"], str(state_dir / "case-data" / "home"))
+            self.assertEqual(
+                case_env["xdg_config_home"],
+                str(state_dir / "case-data" / "config-home"),
+            )
+            self.assertEqual(case_env["path_entries"][0], str(state_dir / "case-bin"))
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+            success_metadata = self.metadata_from_update(transcript[1]["argv"])
+            self.assertEqual(success_metadata["last_afk_run_commit"], commit_sha)
+            self.assertNotIn(token_value, transcript_path.read_text(encoding="utf-8"))
+            self.assert_secret_not_in_tree(state_dir, token_value)
+            self.assertNotIn(secret_value, transcript_path.read_text(encoding="utf-8"))
+
+    def test_cli_lifecycle_close_preflight_reports_missing_gh_before_case(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            case_marker = tmp_path / "case-ran"
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "from pathlib import Path",
+                        f"Path({str(case_marker)!r}).write_text('ran\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-life.4")
+            client, transcript_path, _secret_value = self.client(tmp_path)
+            fake_bin = tmp_path / "no-gh-bin"
+            fake_bin.mkdir()
+            (fake_bin / "python3").symlink_to(sys.executable)
+            git_command = shutil.which("git")
+            self.assertIsNotNone(git_command)
+            (fake_bin / "git").symlink_to(str(git_command))
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-life.4",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--bd-command",
+                client.bd_command,
+                "--beads-workspace",
+                str(client.beads_workspace),
+                "--beads-password-file",
+                str(client.beads_password_file),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                env={
+                    "FAKE_BD_TRANSCRIPT": str(transcript_path),
+                    "PATH": str(fake_bin),
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("missing gh executable", result.stderr)
+            self.assertFalse(case_marker.exists())
+            self.assertFalse((target_repo / ".case").exists())
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+            self.assertIn("missing gh executable", transcript[0]["stdin"])
+            failure_metadata = self.metadata_from_update(transcript[1]["argv"])
+            self.assertEqual(failure_metadata["last_afk_run_result"], "failure")
+
+    def test_cli_lifecycle_close_preflight_reports_missing_remote_permissions_before_case(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            case_marker = tmp_path / "case-ran"
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "from pathlib import Path",
+                        f"Path({str(case_marker)!r}).write_text('ran\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-life.5")
+            client, transcript_path, _secret_value = self.client(tmp_path)
+            fake_bin, gh_transcript_path = self.fake_gh(
+                tmp_path,
+                repo_exit_code=1,
+                repo_stderr="HTTP 404: repository not found",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-life.5",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--bd-command",
+                client.bd_command,
+                "--beads-workspace",
+                str(client.beads_workspace),
+                "--beads-password-file",
+                str(client.beads_password_file),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                env={
+                    "FAKE_BD_TRANSCRIPT": str(transcript_path),
+                    "FAKE_GH_TRANSCRIPT": str(gh_transcript_path),
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("missing remote permissions for local/test", result.stderr)
+            self.assertFalse(case_marker.exists())
+            self.assertFalse((target_repo / ".case").exists())
+            gh_transcript = json.loads(gh_transcript_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                gh_transcript,
+                [
+                    {"argv": ["auth", "status"]},
+                    {"argv": ["repo", "view", "local/test", "--json", "nameWithOwner"]},
+                ],
+            )
+            transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
+            self.assertIn("missing remote permissions", transcript[0]["stdin"])
+
     def test_cli_lifecycle_success_records_metadata_and_closes(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
             commit_sha = self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -378,6 +1031,7 @@ class BeadsLifecycleTest(unittest.TestCase):
             bead_json = tmp_path / "bead.json"
             self.write_eligible_bead(bead_json, target_repo, "central-life.1")
             client, transcript_path, secret_value = self.client(tmp_path)
+            fake_bin, gh_transcript_path = self.fake_gh(tmp_path)
 
             result = run_cli(
                 "run",
@@ -399,10 +1053,22 @@ class BeadsLifecycleTest(unittest.TestCase):
                 str(client.beads_password_file),
                 "--beads-lifecycle",
                 "--close-bead-on-success",
-                env={"FAKE_BD_TRANSCRIPT": str(transcript_path)},
+                env={
+                    "FAKE_BD_TRANSCRIPT": str(transcript_path),
+                    "FAKE_GH_TRANSCRIPT": str(gh_transcript_path),
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                },
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            gh_transcript = json.loads(gh_transcript_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                gh_transcript,
+                [
+                    {"argv": ["auth", "status"]},
+                    {"argv": ["repo", "view", "local/test", "--json", "nameWithOwner"]},
+                ],
+            )
             transcript = json.loads(transcript_path.read_text(encoding="utf-8"))
             self.assertEqual(len(transcript), 3)
             self.assertEqual(transcript[0]["argv"][:2], ["update", "central-life.1"])
