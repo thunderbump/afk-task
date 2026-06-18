@@ -53,6 +53,12 @@ class CaseCodexSession:
     scout_only: bool
 
 
+@dataclass(frozen=True)
+class GithubPrPreflightFailure:
+    kind: str
+    message: str
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="automation-simple-workflow")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -103,7 +109,14 @@ def main(argv: list[str] | None = None) -> int:
         default="/home/bump/Projects/beads/secrets/dolt_beads_password.txt",
     )
     run.add_argument("--beads-lifecycle", action="store_true")
-    run.add_argument("--close-bead-on-success", action="store_true")
+    run.add_argument(
+        "--close-bead-on-success",
+        action="store_true",
+        help=(
+            "Close the Bead after Case succeeds; preflights GitHub CLI PR "
+            "capability before launching Case."
+        ),
+    )
 
     select = subparsers.add_parser("select-workstream")
     select_scope = select.add_mutually_exclusive_group(required=True)
@@ -166,7 +179,14 @@ def main(argv: list[str] | None = None) -> int:
         default="/home/bump/Projects/beads/secrets/dolt_beads_password.txt",
     )
     run_workstream_parser.add_argument("--beads-lifecycle", action="store_true")
-    run_workstream_parser.add_argument("--close-bead-on-success", action="store_true")
+    run_workstream_parser.add_argument(
+        "--close-bead-on-success",
+        action="store_true",
+        help=(
+            "Close each Bead after Case succeeds; preflights GitHub CLI PR "
+            "capability before launching Case."
+        ),
+    )
     run_workstream_parser.add_argument(
         "--skip-final-validation",
         action="store_true",
@@ -369,6 +389,55 @@ def run_bead(
     target_worktree_checkout = None
     case_data = case_data_dir or state_dir / "case-data"
     review_branch = review_branch_for(bead_id=bead_id, metadata=metadata)
+    if close_bead_on_success:
+        preflight_failure = github_pr_preflight_failure(
+            target_repo=str(metadata["target_repo"])
+        )
+        if preflight_failure is not None:
+            run_id = make_run_id(bead_id)
+            run_dir = state_dir / "runs" / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            write_github_pr_preflight_failure(
+                run_dir=run_dir,
+                target_repo=str(metadata["target_repo"]),
+                failure=preflight_failure,
+            )
+            if lifecycle_client is not None:
+                lifecycle_run = LifecycleRun(
+                    bead_id=bead_id,
+                    run_id=run_id,
+                    review_branch=review_branch,
+                    target_checkout_mode=target_checkout_mode,
+                    target_checkout_path=target_repo,
+                    target_source_checkout=target_source_checkout,
+                    target_worktree_checkout=None,
+                    archive_path=run_dir,
+                )
+                try:
+                    lifecycle_client.record_failure(
+                        lifecycle_run,
+                        interpreted_exit_code=1,
+                        failure_summary=(
+                            "GitHub PR preflight failed: "
+                            f"{preflight_failure.message}"
+                        ),
+                        next_action=(
+                            "Fix GitHub CLI authentication or repo access, then "
+                            "rerun. Case was not started."
+                        ),
+                    )
+                except BeadsLifecycleError as error:
+                    print(
+                        "run-bead lifecycle preflight failure update failed: "
+                        f"{error}",
+                        file=sys.stderr,
+                    )
+            print(
+                "run-bead GitHub PR preflight failed: "
+                f"{preflight_failure.message}",
+                file=sys.stderr,
+            )
+            return 1
     try:
         if skip_target_preparation:
             git_dir = run_target_git(target_repo, "rev-parse", "--git-dir")
@@ -1021,6 +1090,106 @@ def write_case_cli_shim(
 
 def resolve_case_command(case_command: str) -> str | None:
     return shutil.which(os.path.expanduser(case_command))
+
+
+def github_pr_preflight_failure(*, target_repo: str) -> GithubPrPreflightFailure | None:
+    gh_command = shutil.which("gh")
+    if gh_command is None:
+        return GithubPrPreflightFailure(
+            kind="missing-gh",
+            message=(
+                "missing gh executable; install GitHub CLI and make it available "
+                "on PATH before using --close-bead-on-success"
+            ),
+        )
+
+    preflight_env = os.environ.copy()
+    preflight_env["GH_PROMPT_DISABLED"] = "1"
+    auth_result = run_github_pr_preflight_command(
+        [gh_command, "auth", "status"],
+        env=preflight_env,
+    )
+    if auth_result.returncode != 0:
+        detail = github_preflight_detail(auth_result)
+        message = (
+            "unauthenticated gh or missing required GitHub token; run `gh auth "
+            "login` or set GH_TOKEN/GITHUB_TOKEN with repo access"
+        )
+        if detail:
+            message = f"{message}. gh auth status: {detail}"
+        return GithubPrPreflightFailure(kind="unauthenticated-gh", message=message)
+
+    repo_result = run_github_pr_preflight_command(
+        [gh_command, "repo", "view", target_repo, "--json", "nameWithOwner"],
+        env=preflight_env,
+    )
+    if repo_result.returncode != 0:
+        detail = github_preflight_detail(repo_result)
+        message = (
+            f"missing remote permissions for {target_repo}; ensure the repository "
+            "exists and gh/GH_TOKEN/GITHUB_TOKEN can access it"
+        )
+        if detail:
+            message = f"{message}. gh repo view: {detail}"
+        return GithubPrPreflightFailure(kind="missing-remote-permissions", message=message)
+
+    return None
+
+
+def run_github_pr_preflight_command(
+    command: list[str], *, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        return subprocess.CompletedProcess(command, 1, "", str(error))
+
+
+def github_preflight_detail(result: subprocess.CompletedProcess[str]) -> str:
+    detail = (result.stderr or result.stdout).strip()
+    detail = redact_text(
+        detail,
+        [
+            os.environ.get("GH_TOKEN"),
+            os.environ.get("GITHUB_TOKEN"),
+        ],
+    )
+    detail = " ".join(detail.split())
+    if len(detail) > 400:
+        return detail[:397] + "..."
+    return detail
+
+
+def write_github_pr_preflight_failure(
+    *,
+    run_dir: Path,
+    target_repo: str,
+    failure: GithubPrPreflightFailure,
+) -> Path:
+    result_path = run_dir / "github-pr-preflight.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "ok": False,
+                "target_repo": target_repo,
+                "failure_kind": failure.kind,
+                "failure": failure.message,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return result_path
 
 
 def write_pi_codex_models_config(codex_session: CaseCodexSession) -> Path:

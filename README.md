@@ -175,6 +175,18 @@ Lifecycle mode sets `active_run_*` metadata before Case starts, records
 clears active metadata, and can close the bead on success. Beads credentials are
 kept in the `bd` subprocess environment and are removed before invoking Case.
 
+When `--close-bead-on-success` is set, the workflow treats the unattended Case
+close as a GitHub PR close. Before it starts Case, it verifies that `gh` is on
+`PATH`, `gh auth status` succeeds, and `gh repo view <target_repo>` can read the
+target repository. Failures are reported as missing `gh`, unauthenticated
+`gh`/missing `GH_TOKEN` or `GITHUB_TOKEN`, or missing remote permissions. With
+`--beads-lifecycle`, those preflight failures are recorded as `last_afk_run_*`
+failure metadata and a Beads comment; Case is not started.
+
+There is no separate no-PR/archive-only close mode today. For archive-only
+lifecycle metadata, omit `--close-bead-on-success`; the bead stays open and the
+wrapper does not preflight GitHub PR capability.
+
 To prepare native Case's default Pi transport to use a local Codex ChatGPT
 session token, pass:
 

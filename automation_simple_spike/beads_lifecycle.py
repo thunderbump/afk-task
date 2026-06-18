@@ -97,7 +97,13 @@ class BeadsLifecycleClient:
         *,
         interpreted_exit_code: int,
         failure_summary: str,
+        next_action: str | None = None,
     ) -> None:
+        if next_action is None:
+            next_action = (
+                "inspect case-stdout.txt and case-stderr.txt in the archive, fix "
+                "the failure, then rerun when ready."
+            )
         comment = "\n".join(
             [
                 "AFK run failed.",
@@ -108,10 +114,7 @@ class BeadsLifecycleClient:
                 f"Exit code: {interpreted_exit_code}",
                 f"Failure: {failure_summary}",
                 "",
-                (
-                    "Next action: inspect case-stdout.txt and case-stderr.txt in the "
-                    "archive, fix the failure, then rerun when ready."
-                ),
+                f"Next action: {next_action}",
                 "",
             ]
         )
