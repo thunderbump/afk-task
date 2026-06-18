@@ -1,0 +1,107 @@
+From 5f0b7412dc20bcfd86090b582fc56e5ed425c2ea Mon Sep 17 00:00:00 2001
+From: Test User <test@example.com>
+Date: Wed, 17 Jun 2026 20:08:19 -0700
+Subject: [PATCH] fix(prompts): avoid phase status self-transitions
+
+---
+ agents/closer.md                     |  2 +-
+ agents/implementer.md                |  3 +--
+ agents/reviewer.md                   |  3 +--
+ agents/verifier.md                   |  3 +--
+ src/__tests__/package-assets.spec.ts | 17 ++++++++++++++++-
+ 5 files changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/agents/closer.md b/agents/closer.md
+index 7530511..144fe21 100644
+--- a/agents/closer.md
++++ b/agents/closer.md
+@@ -32,7 +32,7 @@ Read the output to understand: current branch, last commits, task status, which
+ 
+ ### 0.5. Record Start
+ 
+-Mark yourself as running with a start timestamp immediately:
++Mark yourself as running with a start timestamp immediately. The orchestrator has already moved the task into the phase status; do not run a task-level `status closing` transition at startup.
+ 
+ ```bash
+ ca status <task.json> agent closer status running
+diff --git a/agents/implementer.md b/agents/implementer.md
+index 48217ee..cfc95de 100644
+--- a/agents/implementer.md
++++ b/agents/implementer.md
+@@ -34,9 +34,8 @@ Read the output to understand: current branch, last commits, task status, which
+ 
+ ### 1. Setup
+ 
+-1. Update task JSON: set status to `implementing` and agent phase to running
++1. Record the implementer agent start. The orchestrator has already moved the task into the phase status; do not run a task-level `status implementing` transition at startup.
+    ```bash
+-   ca status <task.json> status implementing
+    ca status <task.json> agent implementer status running
+    ca status <task.json> agent implementer started now
+    ```
+diff --git a/agents/reviewer.md b/agents/reviewer.md
+index 50648c4..caa38c3 100644
+--- a/agents/reviewer.md
++++ b/agents/reviewer.md
+@@ -31,9 +31,8 @@ Read the output to understand: current branch, last commits, task status, which
+ 
+ ### 1. Gather Context
+ 
+-1. Update task JSON:
++1. Record the reviewer agent start. The orchestrator has already moved the task into the phase status; do not run a task-level `status reviewing` transition at startup.
+    ```bash
+-   ca status <task.json> status reviewing
+    ca status <task.json> agent reviewer status running
+    ca status <task.json> agent reviewer started now
+    ```
+diff --git a/agents/verifier.md b/agents/verifier.md
+index e951429..9fd9f4d 100644
+--- a/agents/verifier.md
++++ b/agents/verifier.md
+@@ -33,9 +33,8 @@ Read the output to understand: current branch, last commits, task status, which
+ 
+ > **Prior context:** if the implementer ran before you, the orchestrator prepends a `## Prior Context` block to this prompt that summarizes their approach, the files they changed, and any errors they hit. Use it to scope your verification — focus on the listed files and the implementer's stated approach rather than re-deriving everything from `git diff`. If the block is absent, this is a cold start.
+ 
+-1. Update task JSON:
++1. Record the verifier agent start. The orchestrator has already moved the task into the phase status; do not run a task-level `status verifying` transition at startup.
+    ```bash
+-   ca status <task.json> status verifying
+    ca status <task.json> agent verifier status running
+    ca status <task.json> agent verifier started now
+    ```
+diff --git a/src/__tests__/package-assets.spec.ts b/src/__tests__/package-assets.spec.ts
+index da24109..84599be 100644
+--- a/src/__tests__/package-assets.spec.ts
++++ b/src/__tests__/package-assets.spec.ts
+@@ -1,7 +1,7 @@
+ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+ import { tmpdir } from 'node:os';
+-import { join } from 'node:path';
++import { join, resolve } from 'node:path';
+ import { EMBEDDED_PACKAGE_ROOT } from '../paths.js';
+ import { packageAssetExistsSync, readPackageAsset, readPackageAssetSync } from '../package-assets.js';
+ 
+@@ -35,4 +35,19 @@ describe('package assets', () => {
+     expect(packageAssetExistsSync('agents/reviewer.md', { packageRoot: EMBEDDED_PACKAGE_ROOT })).toBe(true);
+     expect(packageAssetExistsSync('agents/not-real.md', { packageRoot: EMBEDDED_PACKAGE_ROOT })).toBe(false);
+   });
++
++  it('does not ask phase agents to self-transition task phase status at startup', () => {
++    const packageRoot = resolve(import.meta.dir, '..', '..');
++    const prompts = [
++      readPackageAssetSync('agents/implementer.md', { packageRoot }),
++      readPackageAssetSync('agents/verifier.md', { packageRoot }),
++      readPackageAssetSync('agents/reviewer.md', { packageRoot }),
++      readPackageAssetSync('agents/closer.md', { packageRoot }),
++    ].join('\n');
++
++    expect(prompts).not.toContain('ca status <task.json> status implementing');
++    expect(prompts).not.toContain('ca status <task.json> status verifying');
++    expect(prompts).not.toContain('ca status <task.json> status reviewing');
++    expect(prompts).not.toContain('ca status <task.json> status closing');
++  });
+ });
+-- 
+2.43.0
+

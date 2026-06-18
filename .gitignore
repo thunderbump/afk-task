@@ -1,7 +1,7 @@
 .automation-simple/
 .case/
 node_modules/
-workos-case/
+/workos-case/
 sandcastle/
 .external/
 .env
