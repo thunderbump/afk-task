@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .beads_env import beads_subprocess_env
 from .workstream_context import (
@@ -62,6 +63,10 @@ class TargetRepoPreparationError(ValueError):
     pass
 
 
+class GithubTargetRepoResolutionError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class CaseCodexSession:
     access_token: str
@@ -75,6 +80,16 @@ class CaseCodexSession:
 class GithubPrPreflightFailure:
     kind: str
     message: str
+
+
+@dataclass(frozen=True)
+class GithubTargetRepoResolution:
+    metadata_repo: str
+    canonical_repo: str
+    remote_name: str
+    remote_repo: str
+    sanitized_remote_url: str
+    source: str
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -414,6 +429,7 @@ def run_bead(
         return 1
 
     metadata = issue["metadata"]
+    issue_for_run = issue
     target_source_checkout = Path(str(metadata["target_repo_path"])).resolve()
     target_repo = target_source_checkout
     target_worktree_checkout = None
@@ -421,23 +437,41 @@ def run_bead(
     case_data = case_data_dir or state_dir / "case-data"
     review_branch = review_branch_for(bead_id=bead_id, metadata=metadata)
     planned_case_cli_shim = case_cli_shim_path(state_dir)
+    target_repo_name = str(metadata["target_repo"])
     if close_bead_on_success:
-        preflight_env = build_case_command_env(
-            case_data_dir=case_data,
-            case_cli_shim=planned_case_cli_shim,
-            codex_session=codex_session,
-        )
-        preflight_failure = github_pr_preflight_failure(
-            target_repo=str(metadata["target_repo"]),
-            env=preflight_env,
-        )
+        try:
+            target_repo_resolution = resolve_github_target_repo(
+                metadata_repo=target_repo_name,
+                target_checkout=target_source_checkout,
+            )
+        except GithubTargetRepoResolutionError as error:
+            preflight_failure = GithubPrPreflightFailure(
+                kind="invalid-target-repo-remote",
+                message=str(error),
+            )
+        else:
+            target_repo_name = target_repo_resolution.canonical_repo
+            issue_for_run = issue_with_resolved_target_repo(
+                issue,
+                target_repo_resolution,
+            )
+            metadata = issue_for_run["metadata"]
+            preflight_env = build_case_command_env(
+                case_data_dir=case_data,
+                case_cli_shim=planned_case_cli_shim,
+                codex_session=codex_session,
+            )
+            preflight_failure = github_pr_preflight_failure(
+                target_repo=target_repo_name,
+                env=preflight_env,
+            )
         if preflight_failure is not None:
             run_id = make_run_id(bead_id)
             run_dir = state_dir / "runs" / run_id
             run_dir.mkdir(parents=True, exist_ok=True)
             write_github_pr_preflight_failure(
                 run_dir=run_dir,
-                target_repo=str(metadata["target_repo"]),
+                target_repo=target_repo_name,
                 failure=preflight_failure,
             )
             if lifecycle_client is not None:
@@ -513,7 +547,7 @@ def run_bead(
     run_dir = state_dir.resolve() / "runs" / make_run_id(bead_id)
     try:
         validation_command = compile_validation_metadata(
-            issue=issue,
+            issue=issue_for_run,
             state_dir=state_dir,
             review_branch=review_branch,
             target_checkout_path=target_repo,
@@ -525,14 +559,14 @@ def run_bead(
         print(f"run-bead validation metadata invalid: {error}", file=sys.stderr)
         return 1
     task_md, task_json = write_case_task(
-        issue=issue,
+        issue=issue_for_run,
         target_repo=target_repo,
         review_branch=review_branch,
         workstream_context=workstream_context,
     )
     write_case_projects_manifest(
         case_data_dir=case_data,
-        repo_name=str(metadata["target_repo"]),
+        repo_name=target_repo_name,
         repo_path=target_repo,
         validation_command=validation_command,
         codex_session=codex_session,
@@ -546,7 +580,7 @@ def run_bead(
     )
     request_path = write_execution_request(
         state_dir=state_dir,
-        issue=issue,
+        issue=issue_for_run,
         task_md=task_md,
         task_json=task_json,
         case_checkout=case_checkout,
@@ -575,7 +609,7 @@ def run_bead(
             target_source_checkout=target_source_checkout,
             target_worktree_checkout=target_worktree_checkout,
             archive_path=request_path.parent,
-            validation_evidence_path=validation_evidence_path(issue),
+            validation_evidence_path=validation_evidence_path(issue_for_run),
         )
         try:
             lifecycle_client.record_start(lifecycle_run)
@@ -1140,6 +1174,142 @@ def git_error_message(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stderr or result.stdout).strip() or f"git exited {result.returncode}"
 
 
+def resolve_github_target_repo(
+    *, metadata_repo: str, target_checkout: Path
+) -> GithubTargetRepoResolution:
+    remote_name = "origin"
+    remote_result = run_target_git(target_checkout, "remote", "get-url", remote_name)
+    if remote_result.returncode != 0:
+        raise GithubTargetRepoResolutionError(
+            f"target checkout {target_checkout} does not have an {remote_name} "
+            "remote; add an origin remote that points at GitHub before using "
+            "--close-bead-on-success. git remote get-url origin: "
+            f"{git_error_message(remote_result)}"
+        )
+
+    remote_url = remote_result.stdout.strip()
+    sanitized_remote_url = sanitize_git_remote_url(remote_url)
+    remote_repo = github_repo_from_remote_url(remote_url)
+    if remote_repo is None:
+        raise GithubTargetRepoResolutionError(
+            f"target checkout {target_checkout} {remote_name} remote is not a "
+            f"GitHub repository ({sanitized_remote_url}); update the checkout "
+            "remote or disable --close-bead-on-success"
+        )
+
+    requested_repo = metadata_repo.strip()
+    if is_canonical_github_repo(requested_repo):
+        if requested_repo.lower() != remote_repo.lower():
+            raise GithubTargetRepoResolutionError(
+                f"metadata target_repo={requested_repo!r} does not match "
+                f"{remote_name} remote GitHub repo {remote_repo!r}; update "
+                "Beads target_repo or use the checkout for that repository"
+            )
+        return GithubTargetRepoResolution(
+            metadata_repo=requested_repo,
+            canonical_repo=requested_repo,
+            remote_name=remote_name,
+            remote_repo=remote_repo,
+            sanitized_remote_url=sanitized_remote_url,
+            source="metadata",
+        )
+
+    return GithubTargetRepoResolution(
+        metadata_repo=requested_repo,
+        canonical_repo=remote_repo,
+        remote_name=remote_name,
+        remote_repo=remote_repo,
+        sanitized_remote_url=sanitized_remote_url,
+        source="origin-remote",
+    )
+
+
+def is_canonical_github_repo(value: str) -> bool:
+    parts = value.split("/")
+    if len(parts) != 2:
+        return False
+    owner, repo = parts
+    return is_github_owner(owner) and is_github_repo_name(repo)
+
+
+def is_github_owner(value: str) -> bool:
+    if not value or len(value) > 39:
+        return False
+    if not value[0].isalnum() or not value[-1].isalnum():
+        return False
+    return all(character.isalnum() or character == "-" for character in value)
+
+
+def is_github_repo_name(value: str) -> bool:
+    if not value or value in {".", ".."} or value.endswith(".git"):
+        return False
+    return all(
+        character.isalnum() or character in {".", "_", "-"} for character in value
+    )
+
+
+def github_repo_from_remote_url(remote_url: str) -> str | None:
+    remote_url = remote_url.strip()
+    if not remote_url:
+        return None
+
+    if "://" in remote_url:
+        parsed = urlsplit(remote_url)
+        if (parsed.hostname or "").lower() != "github.com":
+            return None
+        path = parsed.path
+    else:
+        host, separator, path = remote_url.partition(":")
+        if not separator:
+            return None
+        host = host.rsplit("@", 1)[-1]
+        if host.lower() != "github.com":
+            return None
+
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) != 2:
+        return None
+    owner, repo = parts
+    if not is_github_owner(owner) or not is_github_repo_name(repo):
+        return None
+    return f"{owner}/{repo}"
+
+
+def sanitize_git_remote_url(remote_url: str) -> str:
+    remote_url = remote_url.strip()
+    if "://" in remote_url:
+        parsed = urlsplit(remote_url)
+        netloc = parsed.hostname or ""
+        if parsed.port is not None:
+            netloc = f"{netloc}:{parsed.port}"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+    host, separator, path = remote_url.partition(":")
+    if separator and "@" in host:
+        return f"{host.rsplit('@', 1)[-1]}:{path}"
+    return remote_url
+
+
+def issue_with_resolved_target_repo(
+    issue: dict[str, Any], resolution: GithubTargetRepoResolution
+) -> dict[str, Any]:
+    resolved_issue = dict(issue)
+    metadata = dict(issue["metadata"])
+    metadata["target_repo"] = resolution.canonical_repo
+    metadata["target_repo_metadata"] = resolution.metadata_repo
+    metadata["target_repo_resolution"] = {
+        "source": resolution.source,
+        "remote_name": resolution.remote_name,
+        "remote_repo": resolution.remote_repo,
+        "remote_url": resolution.sanitized_remote_url,
+    }
+    resolved_issue["metadata"] = metadata
+    return resolved_issue
+
+
 def target_head_commit(target_repo: Path) -> str:
     result = run_target_git(target_repo, "rev-parse", "HEAD")
     if result.returncode != 0:
@@ -1583,6 +1753,10 @@ def write_execution_request(
     if workstream_seed_ref is not None:
         payload["workstream_seed_ref"] = workstream_seed_ref
         payload["workstream_seed_commit"] = workstream_seed_commit
+    if "target_repo_metadata" in metadata:
+        payload["target_repo_metadata"] = metadata["target_repo_metadata"]
+    if isinstance(metadata.get("target_repo_resolution"), dict):
+        payload["target_repo_resolution"] = metadata["target_repo_resolution"]
     request_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True)
         + "\n",

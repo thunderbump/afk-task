@@ -59,6 +59,7 @@ class RunBeadCliTest(unittest.TestCase):
         target_repo: Path,
         bead_id: str,
         target_base_branch: str = "main",
+        target_repo_name: str = "local/test",
     ) -> None:
         path.write_text(
             json.dumps(
@@ -71,7 +72,7 @@ class RunBeadCliTest(unittest.TestCase):
                     "metadata": {
                         "afk_enabled": True,
                         "afk_runner": "codex",
-                        "target_repo": "local/test",
+                        "target_repo": target_repo_name,
                         "target_repo_path": str(target_repo),
                         "target_base_branch": target_base_branch,
                         "branch_policy": "independent",
@@ -108,6 +109,79 @@ class RunBeadCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         return token
+
+    def write_fake_case(self, path: Path) -> None:
+        path.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, os, sys",
+                    "from pathlib import Path",
+                    "Path(sys.argv[0]).with_suffix('.json').write_text(json.dumps({",
+                    "  'argv': sys.argv[1:],",
+                    "  'cwd': os.getcwd(),",
+                    "}) + '\\n', encoding='utf-8')",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    def write_fake_gh(self, bin_dir: Path) -> Path:
+        bin_dir.mkdir()
+        fake_gh = bin_dir / "gh"
+        fake_gh.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, os, sys",
+                    "from pathlib import Path",
+                    "log_path = Path(os.environ['FAKE_GH_LOG'])",
+                    "calls = json.loads(log_path.read_text(encoding='utf-8')) if log_path.exists() else []",
+                    "calls.append(sys.argv[1:])",
+                    "log_path.write_text(json.dumps(calls) + '\\n', encoding='utf-8')",
+                    "if sys.argv[1:3] == ['auth', 'status']:",
+                    "    raise SystemExit(0)",
+                    "if sys.argv[1:3] == ['repo', 'view']:",
+                    "    allowed = set(filter(None, os.environ.get('FAKE_GH_ALLOWED_REPOS', '').split(',')))",
+                    "    repo = sys.argv[3]",
+                    "    if repo in allowed:",
+                    "        print(json.dumps({'nameWithOwner': repo}))",
+                    "        raise SystemExit(0)",
+                    "    print(f'no access to {repo}', file=sys.stderr)",
+                    "    raise SystemExit(1)",
+                    "raise SystemExit(1)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+        return fake_gh
+
+    def write_fake_bd(self, path: Path) -> None:
+        path.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import json, os, sys",
+                    "from pathlib import Path",
+                    "log_path = Path(os.environ['FAKE_BD_LOG'])",
+                    "calls = json.loads(log_path.read_text(encoding='utf-8')) if log_path.exists() else []",
+                    "calls.append({'argv': sys.argv[1:], 'stdin': sys.stdin.read()})",
+                    "log_path.write_text(json.dumps(calls) + '\\n', encoding='utf-8')",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    def write_fake_beads_workspace(self, path: Path) -> Path:
+        path.mkdir()
+        secrets_dir = path / "secrets"
+        secrets_dir.mkdir()
+        password_file = secrets_dir / "dolt_beads_password.txt"
+        password_file.write_text("dummy-password\n", encoding="utf-8")
+        return password_file
 
     def test_ineligible_bead_stops_before_case_state_or_execution(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -317,6 +391,386 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertEqual(execution_request["case_cli_shim"], str(case_cli_shim))
             self.assertNotIn("ambient-openai-key", json.dumps(execution_request))
             self.assertNotIn("must-not-reach-case", json.dumps(execution_request))
+
+    def test_close_preflight_uses_github_origin_for_shorthand_target_repo(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.git(
+                target_repo,
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:thunderbump/afk-task.git",
+            )
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            self.write_fake_case(fake_case)
+            beads_workspace = tmp_path / "beads"
+            password_file = self.write_fake_beads_workspace(beads_workspace)
+            fake_bd = tmp_path / "fake-bd"
+            self.write_fake_bd(fake_bd)
+            fake_gh_bin = tmp_path / "bin"
+            self.write_fake_gh(fake_gh_bin)
+            gh_log = tmp_path / "gh-log.json"
+            bd_log = tmp_path / "bd-log.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(
+                bead_json,
+                target_repo,
+                "central-preflight.1",
+                target_repo_name="automation-simple-spike",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-preflight.1",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "PATH": f"{fake_gh_bin}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_GH_ALLOWED_REPOS": "thunderbump/afk-task",
+                    "FAKE_BD_LOG": str(bd_log),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            gh_calls = json.loads(gh_log.read_text(encoding="utf-8"))
+            self.assertEqual(gh_calls[0], ["auth", "status"])
+            self.assertEqual(
+                gh_calls[1],
+                ["repo", "view", "thunderbump/afk-task", "--json", "nameWithOwner"],
+            )
+            execution_request = json.loads(
+                next(state_dir.glob("runs/*/execution-request.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(execution_request["target_repo"], "thunderbump/afk-task")
+            self.assertEqual(
+                execution_request["target_repo_metadata"],
+                "automation-simple-spike",
+            )
+            task_json = json.loads(
+                (
+                    target_repo
+                    / ".case"
+                    / "tasks"
+                    / "active"
+                    / "central-preflight.1.task.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(task_json["repo"], "thunderbump/afk-task")
+
+    def test_close_preflight_keeps_matching_canonical_target_repo(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.git(
+                target_repo,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ThunderBump/afk-task.git",
+            )
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            self.write_fake_case(fake_case)
+            beads_workspace = tmp_path / "beads"
+            password_file = self.write_fake_beads_workspace(beads_workspace)
+            fake_bd = tmp_path / "fake-bd"
+            self.write_fake_bd(fake_bd)
+            fake_gh_bin = tmp_path / "bin"
+            self.write_fake_gh(fake_gh_bin)
+            gh_log = tmp_path / "gh-log.json"
+            bd_log = tmp_path / "bd-log.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(
+                bead_json,
+                target_repo,
+                "central-preflight.2",
+                target_repo_name="thunderbump/afk-task",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-preflight.2",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "PATH": f"{fake_gh_bin}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_GH_ALLOWED_REPOS": "thunderbump/afk-task",
+                    "FAKE_BD_LOG": str(bd_log),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            gh_calls = json.loads(gh_log.read_text(encoding="utf-8"))
+            self.assertEqual(
+                gh_calls[1],
+                ["repo", "view", "thunderbump/afk-task", "--json", "nameWithOwner"],
+            )
+            execution_request = json.loads(
+                next(state_dir.glob("runs/*/execution-request.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(execution_request["target_repo"], "thunderbump/afk-task")
+            self.assertEqual(
+                execution_request["target_repo_resolution"]["source"],
+                "metadata",
+            )
+
+    def test_close_preflight_fails_when_origin_remote_is_missing(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            self.write_fake_case(fake_case)
+            beads_workspace = tmp_path / "beads"
+            password_file = self.write_fake_beads_workspace(beads_workspace)
+            fake_bd = tmp_path / "fake-bd"
+            self.write_fake_bd(fake_bd)
+            fake_gh_bin = tmp_path / "bin"
+            self.write_fake_gh(fake_gh_bin)
+            gh_log = tmp_path / "gh-log.json"
+            bd_log = tmp_path / "bd-log.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(
+                bead_json,
+                target_repo,
+                "central-preflight.3",
+                target_repo_name="automation-simple-spike",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-preflight.3",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "PATH": f"{fake_gh_bin}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_GH_ALLOWED_REPOS": "thunderbump/afk-task",
+                    "FAKE_BD_LOG": str(bd_log),
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("does not have an origin remote", result.stderr)
+            self.assertIn("add an origin remote that points at GitHub", result.stderr)
+            self.assertFalse(gh_log.exists())
+            self.assertFalse(fake_case.with_suffix(".json").exists())
+            failure = json.loads(
+                next(state_dir.glob("runs/*/github-pr-preflight.json")).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(failure["failure_kind"], "invalid-target-repo-remote")
+
+    def test_close_preflight_fails_when_origin_remote_is_not_github(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.git(
+                target_repo,
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.com/thunderbump/afk-task.git",
+            )
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            self.write_fake_case(fake_case)
+            beads_workspace = tmp_path / "beads"
+            password_file = self.write_fake_beads_workspace(beads_workspace)
+            fake_bd = tmp_path / "fake-bd"
+            self.write_fake_bd(fake_bd)
+            fake_gh_bin = tmp_path / "bin"
+            self.write_fake_gh(fake_gh_bin)
+            gh_log = tmp_path / "gh-log.json"
+            bd_log = tmp_path / "bd-log.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(
+                bead_json,
+                target_repo,
+                "central-preflight.4",
+                target_repo_name="automation-simple-spike",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-preflight.4",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "PATH": f"{fake_gh_bin}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_GH_ALLOWED_REPOS": "thunderbump/afk-task",
+                    "FAKE_BD_LOG": str(bd_log),
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("origin remote is not a GitHub repository", result.stderr)
+            self.assertIn("update the checkout remote", result.stderr)
+            self.assertFalse(gh_log.exists())
+            self.assertFalse(fake_case.with_suffix(".json").exists())
+
+    def test_close_preflight_fails_when_canonical_metadata_mismatches_remote(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            self.git(
+                target_repo,
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:thunderbump/afk-task.git",
+            )
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            self.write_fake_case(fake_case)
+            beads_workspace = tmp_path / "beads"
+            password_file = self.write_fake_beads_workspace(beads_workspace)
+            fake_bd = tmp_path / "fake-bd"
+            self.write_fake_bd(fake_bd)
+            fake_gh_bin = tmp_path / "bin"
+            self.write_fake_gh(fake_gh_bin)
+            gh_log = tmp_path / "gh-log.json"
+            bd_log = tmp_path / "bd-log.json"
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(
+                bead_json,
+                target_repo,
+                "central-preflight.5",
+                target_repo_name="other-owner/afk-task",
+            )
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-preflight.5",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                "--beads-lifecycle",
+                "--close-bead-on-success",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "PATH": f"{fake_gh_bin}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_GH_ALLOWED_REPOS": "thunderbump/afk-task",
+                    "FAKE_BD_LOG": str(bd_log),
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(
+                "metadata target_repo='other-owner/afk-task' does not match",
+                result.stderr,
+            )
+            self.assertIn("update Beads target_repo", result.stderr)
+            self.assertFalse(gh_log.exists())
+            self.assertFalse(fake_case.with_suffix(".json").exists())
 
     def test_worker_validation_metadata_emits_executable_case_check_command(
         self,

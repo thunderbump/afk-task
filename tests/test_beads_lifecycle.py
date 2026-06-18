@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -57,6 +58,9 @@ class BeadsLifecycleTest(unittest.TestCase):
         self.git(path, "commit", "-m", "Initial target commit")
         self.git(path, "branch", "-M", "main")
         return self.git(path, "rev-parse", "main").stdout.strip()
+
+    def add_matching_github_origin(self, path: Path) -> None:
+        self.git(path, "remote", "add", "origin", "git@github.com:local/test.git")
 
     def write_eligible_bead(self, path: Path, target_repo: Path, bead_id: str) -> None:
         path.write_text(
@@ -590,6 +594,7 @@ class BeadsLifecycleTest(unittest.TestCase):
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
             self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -688,6 +693,7 @@ class BeadsLifecycleTest(unittest.TestCase):
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
             self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -773,6 +779,7 @@ class BeadsLifecycleTest(unittest.TestCase):
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
             commit_sha = self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -874,6 +881,7 @@ class BeadsLifecycleTest(unittest.TestCase):
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
             self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -896,6 +904,9 @@ class BeadsLifecycleTest(unittest.TestCase):
             fake_bin = tmp_path / "no-gh-bin"
             fake_bin.mkdir()
             (fake_bin / "python3").symlink_to(sys.executable)
+            git_command = shutil.which("git")
+            self.assertIsNotNone(git_command)
+            (fake_bin / "git").symlink_to(str(git_command))
 
             result = run_cli(
                 "run",
@@ -939,6 +950,7 @@ class BeadsLifecycleTest(unittest.TestCase):
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
             self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
@@ -1011,6 +1023,7 @@ class BeadsLifecycleTest(unittest.TestCase):
             tmp_path = Path(tmp)
             target_repo = tmp_path / "target"
             commit_sha = self.init_target_repo(target_repo)
+            self.add_matching_github_origin(target_repo)
             state_dir = tmp_path / ".automation-simple"
             case_checkout = tmp_path / "workos-case"
             case_checkout.mkdir()
