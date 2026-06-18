@@ -38,6 +38,14 @@ REQUIRED_METADATA = [
 
 CODEX_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
 CODEX_TOKEN_EXPIRY_MARGIN_SECONDS = 300
+CASE_ENV_REMOVED_KEYS = (
+    "BEADS_DIR",
+    "BEADS_DOLT_PASSWORD",
+    "AUTOMATION_BEADS_WORKSPACE",
+    "OPENAI_API_KEY",
+    "PI_CODING_AGENT_DIR",
+)
+GITHUB_TOKEN_ENV_KEYS = ("GH_TOKEN", "GITHUB_TOKEN")
 
 
 class TargetRepoPreparationError(ValueError):
@@ -389,9 +397,16 @@ def run_bead(
     target_worktree_checkout = None
     case_data = case_data_dir or state_dir / "case-data"
     review_branch = review_branch_for(bead_id=bead_id, metadata=metadata)
+    planned_case_cli_shim = case_cli_shim_path(state_dir)
     if close_bead_on_success:
+        preflight_env = build_case_command_env(
+            case_data_dir=case_data,
+            case_cli_shim=planned_case_cli_shim,
+            codex_session=codex_session,
+        )
         preflight_failure = github_pr_preflight_failure(
-            target_repo=str(metadata["target_repo"])
+            target_repo=str(metadata["target_repo"]),
+            env=preflight_env,
         )
         if preflight_failure is not None:
             run_id = make_run_id(bead_id)
@@ -541,7 +556,7 @@ def run_bead(
         request_path.parent,
         result,
         interpreted_returncode,
-        redactions=([codex_session.access_token] if codex_session is not None else None),
+        redactions=case_command_redactions(codex_session),
     )
     if interpreted_returncode != 0:
         failure_summary = case_failure_summary(result)
@@ -1068,9 +1083,9 @@ def write_case_projects_manifest(
 def write_case_cli_shim(
     *, state_dir: Path, case_checkout: Path, case_command: str
 ) -> Path:
-    shim_dir = state_dir / "case-bin"
+    shim_path = case_cli_shim_path(state_dir)
+    shim_dir = shim_path.parent
     shim_dir.mkdir(parents=True, exist_ok=True)
-    shim_path = shim_dir / "ca"
     shim_path.write_text(
         "\n".join(
             [
@@ -1088,12 +1103,20 @@ def write_case_cli_shim(
     return shim_path
 
 
+def case_cli_shim_path(state_dir: Path) -> Path:
+    return state_dir / "case-bin" / "ca"
+
+
 def resolve_case_command(case_command: str) -> str | None:
     return shutil.which(os.path.expanduser(case_command))
 
 
-def github_pr_preflight_failure(*, target_repo: str) -> GithubPrPreflightFailure | None:
-    gh_command = shutil.which("gh")
+def github_pr_preflight_failure(
+    *, target_repo: str, env: dict[str, str] | None = None
+) -> GithubPrPreflightFailure | None:
+    preflight_env = dict(env or os.environ)
+    preflight_env["GH_PROMPT_DISABLED"] = "1"
+    gh_command = shutil.which("gh", path=preflight_env.get("PATH"))
     if gh_command is None:
         return GithubPrPreflightFailure(
             kind="missing-gh",
@@ -1103,14 +1126,12 @@ def github_pr_preflight_failure(*, target_repo: str) -> GithubPrPreflightFailure
             ),
         )
 
-    preflight_env = os.environ.copy()
-    preflight_env["GH_PROMPT_DISABLED"] = "1"
     auth_result = run_github_pr_preflight_command(
         [gh_command, "auth", "status"],
         env=preflight_env,
     )
     if auth_result.returncode != 0:
-        detail = github_preflight_detail(auth_result)
+        detail = github_preflight_detail(auth_result, env=preflight_env)
         message = (
             "unauthenticated gh or missing required GitHub token; run `gh auth "
             "login` or set GH_TOKEN/GITHUB_TOKEN with repo access"
@@ -1124,7 +1145,7 @@ def github_pr_preflight_failure(*, target_repo: str) -> GithubPrPreflightFailure
         env=preflight_env,
     )
     if repo_result.returncode != 0:
-        detail = github_preflight_detail(repo_result)
+        detail = github_preflight_detail(repo_result, env=preflight_env)
         message = (
             f"missing remote permissions for {target_repo}; ensure the repository "
             "exists and gh/GH_TOKEN/GITHUB_TOKEN can access it"
@@ -1153,19 +1174,31 @@ def run_github_pr_preflight_command(
         return subprocess.CompletedProcess(command, 1, "", str(error))
 
 
-def github_preflight_detail(result: subprocess.CompletedProcess[str]) -> str:
+def github_preflight_detail(
+    result: subprocess.CompletedProcess[str], *, env: dict[str, str] | None = None
+) -> str:
     detail = (result.stderr or result.stdout).strip()
     detail = redact_text(
         detail,
-        [
-            os.environ.get("GH_TOKEN"),
-            os.environ.get("GITHUB_TOKEN"),
-        ],
+        github_token_redactions(env or os.environ),
     )
     detail = " ".join(detail.split())
     if len(detail) > 400:
         return detail[:397] + "..."
     return detail
+
+
+def github_token_redactions(env: dict[str, str]) -> list[str]:
+    return [env[key] for key in GITHUB_TOKEN_ENV_KEYS if env.get(key)]
+
+
+def case_command_redactions(
+    codex_session: CaseCodexSession | None,
+) -> list[str]:
+    redactions = github_token_redactions(os.environ)
+    if codex_session is not None:
+        redactions.append(codex_session.access_token)
+    return redactions
 
 
 def write_github_pr_preflight_failure(
@@ -1329,27 +1362,11 @@ def run_case_command(
     case_runtime_module: Path | None,
     codex_session: CaseCodexSession | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    for key in (
-        "BEADS_DIR",
-        "BEADS_DOLT_PASSWORD",
-        "AUTOMATION_BEADS_WORKSPACE",
-        "OPENAI_API_KEY",
-        "PI_CODING_AGENT_DIR",
-    ):
-        env.pop(key, None)
-    env["CASE_DATA_DIR"] = str(case_data_dir)
-    env["XDG_CONFIG_HOME"] = str(case_data_dir / "config-home")
-    env["HOME"] = str(case_data_dir / "home")
-    inherited_path = env.get("PATH")
-    env["PATH"] = (
-        f"{case_cli_shim.parent}{os.pathsep}{inherited_path}"
-        if inherited_path
-        else str(case_cli_shim.parent)
+    env = build_case_command_env(
+        case_data_dir=case_data_dir,
+        case_cli_shim=case_cli_shim,
+        codex_session=codex_session,
     )
-    if codex_session is not None:
-        env["OPENAI_API_KEY"] = codex_session.access_token
-        env["PI_CODING_AGENT_DIR"] = str(codex_session.pi_config_dir)
     command = [
         case_command,
         "src/index.ts",
@@ -1372,6 +1389,31 @@ def run_case_command(
         stderr=subprocess.PIPE,
         check=False,
     )
+
+
+def build_case_command_env(
+    *,
+    case_data_dir: Path,
+    case_cli_shim: Path,
+    codex_session: CaseCodexSession | None = None,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in CASE_ENV_REMOVED_KEYS:
+        env.pop(key, None)
+    env["CASE_DATA_DIR"] = str(case_data_dir)
+    env["XDG_CONFIG_HOME"] = str(case_data_dir / "config-home")
+    env["HOME"] = str(case_data_dir / "home")
+    env["GH_PROMPT_DISABLED"] = "1"
+    inherited_path = env.get("PATH")
+    env["PATH"] = (
+        f"{case_cli_shim.parent}{os.pathsep}{inherited_path}"
+        if inherited_path
+        else str(case_cli_shim.parent)
+    )
+    if codex_session is not None:
+        env["OPENAI_API_KEY"] = codex_session.access_token
+        env["PI_CODING_AGENT_DIR"] = str(codex_session.pi_config_dir)
+    return env
 
 
 def write_case_command_result(
