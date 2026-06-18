@@ -392,6 +392,82 @@ class RunBeadCliTest(unittest.TestCase):
             self.assertNotIn("ambient-openai-key", json.dumps(execution_request))
             self.assertNotIn("must-not-reach-case", json.dumps(execution_request))
 
+    def test_case_artifacts_archive_preserves_mutated_case_state(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_repo = tmp_path / "target"
+            self.init_target_repo(target_repo)
+            state_dir = tmp_path / ".automation-simple"
+            case_checkout = tmp_path / "workos-case"
+            case_checkout.mkdir()
+            fake_case = tmp_path / "fake-case"
+            fake_case.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, sys",
+                        "from pathlib import Path",
+                        "task = Path(sys.argv[sys.argv.index('--task') + 1])",
+                        "case_dir = task.parents[2]",
+                        "payload = json.loads(task.read_text(encoding='utf-8'))",
+                        "payload['status'] = 'pr-opened'",
+                        "payload['tested'] = True",
+                        "task.write_text(json.dumps(payload) + '\\n', encoding='utf-8')",
+                        "run_dir = case_dir / payload['id']",
+                        "(run_dir / 'events').mkdir(parents=True)",
+                        "(run_dir / 'events' / 'run.jsonl').write_text('event secret-token\\n', encoding='utf-8')",
+                        "(run_dir / 'tested').write_text('ok\\n', encoding='utf-8')",
+                        "(case_dir / 'retrospective-amendment.md').write_text('amendment\\n', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_case.chmod(0o755)
+            bead_json = tmp_path / "bead.json"
+            self.write_eligible_bead(bead_json, target_repo, "central-run.7")
+
+            result = run_cli(
+                "run",
+                "--bead",
+                "central-run.7",
+                "--bead-json",
+                str(bead_json),
+                "--state-dir",
+                str(state_dir),
+                "--case-checkout",
+                str(case_checkout),
+                "--case-command",
+                str(fake_case),
+                env={"GH_TOKEN": "secret-token"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            archive = next(state_dir.glob("runs/*/case-artifacts/.case"))
+            archived_task = json.loads(
+                (
+                    archive
+                    / "tasks"
+                    / "active"
+                    / "central-run.7.task.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(archived_task["status"], "pr-opened")
+            self.assertTrue(archived_task["tested"])
+            self.assertEqual(
+                (archive / "central-run.7" / "tested").read_text(encoding="utf-8"),
+                "ok\n",
+            )
+            self.assertEqual(
+                (archive / "retrospective-amendment.md").read_text(encoding="utf-8"),
+                "amendment\n",
+            )
+            self.assertEqual(
+                (archive / "central-run.7" / "events" / "run.jsonl").read_text(
+                    encoding="utf-8"
+                ),
+                "event [REDACTED]\n",
+            )
+
     def test_close_preflight_uses_github_origin_for_shorthand_target_repo(
         self,
     ) -> None:
@@ -2208,6 +2284,12 @@ class RunBeadCliTest(unittest.TestCase):
                 "\n".join(
                     [
                         "#!/usr/bin/env python3",
+                        "import sys",
+                        "from pathlib import Path",
+                        "task = Path(sys.argv[sys.argv.index('--task') + 1])",
+                        "case_dir = task.parents[2]",
+                        "(case_dir / 'central-run.4' / 'events').mkdir(parents=True)",
+                        "(case_dir / 'central-run.4' / 'events' / 'run.jsonl').write_text('failed event\\n', encoding='utf-8')",
                         "print('Pipeline failed at implementer phase.')",
                         "raise SystemExit(0)",
                     ]
@@ -2259,6 +2341,12 @@ class RunBeadCliTest(unittest.TestCase):
             case_result = json.loads(run_results[0].read_text(encoding="utf-8"))
             self.assertEqual(case_result["exit_code"], 0)
             self.assertEqual(case_result["interpreted_exit_code"], 1)
+            archived_event = next(
+                state_dir.glob(
+                    "runs/*/case-artifacts/.case/central-run.4/events/run.jsonl"
+                )
+            )
+            self.assertEqual(archived_event.read_text(encoding="utf-8"), "failed event\n")
 
     def test_can_load_bead_through_fake_bd_without_leaking_password_to_case(
         self,

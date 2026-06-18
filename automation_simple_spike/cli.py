@@ -627,6 +627,12 @@ def run_bead(
         case_runtime_module=case_runtime_module,
         codex_session=codex_session,
     )
+    redactions = case_command_redactions(codex_session)
+    archive_case_artifacts(
+        run_dir=request_path.parent,
+        target_repo=target_repo,
+        redactions=redactions,
+    )
     if case_dry_run and generated_task_json is not None:
         preserve_native_dry_run_task(
             run_dir=request_path.parent,
@@ -638,7 +644,7 @@ def run_bead(
         request_path.parent,
         result,
         interpreted_returncode,
-        redactions=case_command_redactions(codex_session),
+        redactions=redactions,
     )
     if interpreted_returncode != 0:
         failure_summary = case_failure_summary(result)
@@ -1876,6 +1882,38 @@ def build_case_command_env(
         env["OPENAI_API_KEY"] = codex_session.access_token
         env["PI_CODING_AGENT_DIR"] = str(codex_session.pi_config_dir)
     return env
+
+
+def archive_case_artifacts(
+    *,
+    run_dir: Path,
+    target_repo: Path,
+    redactions: list[str] | None = None,
+) -> Path | None:
+    case_dir = target_repo / ".case"
+    if not case_dir.exists():
+        return None
+    archive_dir = run_dir / "case-artifacts" / ".case"
+    if archive_dir.exists():
+        shutil.rmtree(archive_dir)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for source in sorted(case_dir.rglob("*")):
+        relative = source.relative_to(case_dir)
+        destination = archive_dir / relative
+        if source.is_symlink():
+            continue
+        if source.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            destination.write_text(
+                redact_text(source.read_text(encoding="utf-8"), redactions),
+                encoding="utf-8",
+            )
+        except UnicodeDecodeError:
+            shutil.copy2(source, destination)
+    return archive_dir
 
 
 def write_case_command_result(

@@ -94,12 +94,15 @@ fake_case = Path(sys.argv[3])
 
 task = target_repo / ".case/tasks/active/central-smoke.1.task.json"
 request = next((state_dir / "runs").glob("*/execution-request.json"))
+archive_task = request.parent / "case-artifacts/.case/tasks/active/central-smoke.1.task.json"
 record = json.loads(fake_case.with_suffix(".json").read_text(encoding="utf-8"))
 
 assert task.is_file(), task
 assert request.is_file(), request
+assert archive_task.is_file(), archive_task
 assert record["beads_password"] is None
 print("smoke passed")
 print(f"task={task}")
 print(f"request={request}")
+print(f"archive_task={archive_task}")
 PY
