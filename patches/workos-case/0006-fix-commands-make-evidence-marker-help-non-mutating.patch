@@ -1,0 +1,185 @@
+From dd18465cd6d6daddef18d51d4b556b26eb7000d8 Mon Sep 17 00:00:00 2001
+From: Test User <test@example.com>
+Date: Wed, 17 Jun 2026 20:15:40 -0700
+Subject: [PATCH] fix(commands): make evidence marker help non-mutating
+
+---
+ src/__tests__/commands.spec.ts     | 42 ++++++++++++++++++++++++++++++
+ src/commands/mark-manual-tested.ts | 23 ++++++++++++++++
+ src/commands/mark-reviewed.ts      | 21 +++++++++++++++
+ src/commands/mark-tested.ts        | 20 ++++++++++++++
+ 4 files changed, 106 insertions(+)
+
+diff --git a/src/__tests__/commands.spec.ts b/src/__tests__/commands.spec.ts
+index 5bab0f8..38f63b9 100644
+--- a/src/__tests__/commands.spec.ts
++++ b/src/__tests__/commands.spec.ts
+@@ -259,6 +259,48 @@ describe('mark-tested handler', () => {
+   });
+ });
+ 
++describe('evidence marker help', () => {
++  let outCapture: ReturnType<typeof captureStream>;
++  let errCapture: ReturnType<typeof captureStream>;
++
++  beforeEach(() => {
++    outCapture = captureStream(process.stdout);
++    errCapture = captureStream(process.stderr);
++  });
++
++  afterEach(() => {
++    outCapture.restore();
++    errCapture.restore();
++  });
++
++  it('prints mark-tested help without enforcing marker preconditions', async () => {
++    const { handler } = await import('../commands/mark-tested.js');
++    const code = await handler(['--help']);
++
++    expect(code).toBe(0);
++    expect(outCapture.lines.join('')).toContain('Usage: ca mark-tested');
++    expect(errCapture.lines.join('')).toBe('');
++  });
++
++  it('prints mark-manual-tested help without enforcing marker preconditions', async () => {
++    const { handler } = await import('../commands/mark-manual-tested.js');
++    const code = await handler(['--help']);
++
++    expect(code).toBe(0);
++    expect(outCapture.lines.join('')).toContain('Usage: ca mark-manual-tested');
++    expect(errCapture.lines.join('')).toBe('');
++  });
++
++  it('prints mark-reviewed help without enforcing marker preconditions', async () => {
++    const { handler } = await import('../commands/mark-reviewed.js');
++    const code = await handler(['--help']);
++
++    expect(code).toBe(0);
++    expect(outCapture.lines.join('')).toContain('Usage: ca mark-reviewed');
++    expect(errCapture.lines.join('')).toBe('');
++  });
++});
++
+ describe('upload handler — preflight checks', () => {
+   let errCapture: ReturnType<typeof captureStream>;
+ 
+diff --git a/src/commands/mark-manual-tested.ts b/src/commands/mark-manual-tested.ts
+index 9967e75..6b3cd1d 100644
+--- a/src/commands/mark-manual-tested.ts
++++ b/src/commands/mark-manual-tested.ts
+@@ -5,6 +5,24 @@ import { updateTaskJson } from './mark-tested.js';
+ 
+ export const description = 'Mark a repo as manually tested (writes .case/<slug>/manual-tested)';
+ 
++function printHelp(): void {
++  process.stdout.write(
++    [
++      'Usage: ca mark-manual-tested [--library]',
++      '',
++      'Writes .case/<slug>/manual-tested from browser evidence or library test output.',
++      '',
++      'Options:',
++      '  --library  Read library/test verification output from stdin',
++      '',
++      'Examples:',
++      '  ca mark-manual-tested',
++      '  pnpm test 2>&1 | ca mark-manual-tested --library',
++      '',
++    ].join('\n'),
++  );
++}
++
+ function resolveTaskSlug(): string | null {
+   if (!existsSync('.case/active')) return null;
+   return readFileSync('.case/active', 'utf-8').trim() || null;
+@@ -30,6 +48,11 @@ function countRecentPngs(dir: string, maxAgeMinutes: number): number {
+ }
+ 
+ export async function handler(argv: string[]): Promise<number> {
++  if (argv.includes('--help') || argv.includes('-h')) {
++    printHelp();
++    return 0;
++  }
++
+   const slug = resolveTaskSlug();
+   if (!slug) {
+     process.stderr.write('ERROR: No active task — .case/active is missing or empty. Run the orchestrator first.\n');
+diff --git a/src/commands/mark-reviewed.ts b/src/commands/mark-reviewed.ts
+index b919c46..44e995f 100644
+--- a/src/commands/mark-reviewed.ts
++++ b/src/commands/mark-reviewed.ts
+@@ -4,12 +4,33 @@ import { resolveDataDir, resolvePackageRoot, resolveRepoTaskJson } from '../path
+ 
+ export const description = 'Mark a repo as reviewed (writes .case/<slug>/reviewed)';
+ 
++function printHelp(): void {
++  process.stdout.write(
++    [
++      'Usage: ca mark-reviewed [--critical N] [--warnings N] [--info N]',
++      '',
++      'Writes .case/<slug>/reviewed when critical findings are zero.',
++      '',
++      'Options:',
++      '  --critical N  Critical findings count; must be 0 to write the marker',
++      '  --warnings N  Warning findings count',
++      '  --info N      Informational findings count',
++      '',
++    ].join('\n'),
++  );
++}
++
+ function resolveTaskSlug(): string | null {
+   if (!existsSync('.case/active')) return null;
+   return readFileSync('.case/active', 'utf-8').trim() || null;
+ }
+ 
+ export async function handler(argv: string[]): Promise<number> {
++  if (argv.includes('--help') || argv.includes('-h')) {
++    printHelp();
++    return 0;
++  }
++
+   let critical = 0;
+   let warnings = 0;
+   let info = 0;
+diff --git a/src/commands/mark-tested.ts b/src/commands/mark-tested.ts
+index a48deba..077e79e 100644
+--- a/src/commands/mark-tested.ts
++++ b/src/commands/mark-tested.ts
+@@ -5,6 +5,21 @@ import { resolveDataDir, resolvePackageRoot, resolveRepoTaskJson } from '../path
+ 
+ export const description = 'Mark a repo as auto-tested (writes .case/<slug>/tested with SHA-256 of test output)';
+ 
++function printHelp(): void {
++  process.stdout.write(
++    [
++      'Usage: ca mark-tested [test-output-file]',
++      '',
++      'Writes .case/<slug>/tested from piped test output or a test output file.',
++      '',
++      'Examples:',
++      '  pnpm test 2>&1 | ca mark-tested',
++      '  ca mark-tested ./test-output.log',
++      '',
++    ].join('\n'),
++  );
++}
++
+ function resolveTaskSlug(): string | null {
+   if (!existsSync('.case/active')) return null;
+   return readFileSync('.case/active', 'utf-8').trim() || null;
+@@ -47,6 +62,11 @@ function parseVitestJson(raw: string): {
+ }
+ 
+ export async function handler(argv: string[]): Promise<number> {
++  if (argv.includes('--help') || argv.includes('-h')) {
++    printHelp();
++    return 0;
++  }
++
+   if (process.stdin.isTTY && !argv.find((a) => !a.startsWith('--') && existsSync(a))) {
+     process.stderr.write(
+       'mark-tested requires test output on stdin or as a file argument: <test-cmd> | ca mark-tested\n',
+-- 
+2.43.0
+
