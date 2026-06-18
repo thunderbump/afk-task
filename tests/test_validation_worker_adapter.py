@@ -62,6 +62,46 @@ class ValidationWorkerAdapterTests(unittest.TestCase):
             self.assertIsNone(record["env"]["PI_CODING_AGENT_DIR"])
             self.assertEqual(record["env"]["VALIDATION_WORKER_REQUEST"], str(request_path))
 
+    def test_remote_transport_accepts_successful_fake_dispatcher(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            request_path = self.write_request(tmp_path)
+            record_path = tmp_path / "remote-record.json"
+            dispatcher = tmp_path / "remote_dispatcher.py"
+            dispatcher.write_text(
+                "\n".join(
+                    [
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "request = Path(sys.argv[sys.argv.index('--request') + 1])",
+                        "payload = json.loads(request.read_text(encoding='utf-8'))",
+                        "Path(payload['evidence_dir'], 'result.json').write_text(json.dumps({'status': 'passed', 'transport': 'remote'}) + '\\n', encoding='utf-8')",
+                        "Path(sys.argv[sys.argv.index('--record') + 1]).write_text(json.dumps({'request': str(request), 'env_request': os.environ.get('VALIDATION_WORKER_REQUEST')}), encoding='utf-8')",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = main(
+                [
+                    "--transport",
+                    "remote",
+                    "--command",
+                    f"{sys.executable} {dispatcher} --record {record_path}",
+                    "--request",
+                    str(request_path),
+                ]
+            )
+
+            self.assertEqual(result, 0)
+            evidence = json.loads((tmp_path / "evidence" / "result.json").read_text())
+            self.assertEqual(evidence["status"], "passed")
+            self.assertEqual(evidence["transport"], "remote")
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["request"], str(request_path))
+            self.assertEqual(record["env_request"], str(request_path))
+
     def test_remote_transport_reports_dispatch_failure(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
