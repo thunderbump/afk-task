@@ -446,6 +446,25 @@ After Case exits, lifecycle mode records success or failure metadata, comments
 actionable failure evidence, clears active metadata, and can close the bead on
 success when `--close-bead-on-success` is set.
 
+### Generated Validation Command Checks
+
+When a bead uses worker-backed validation, the generated Case
+`checkCommand` is command text, not an argv array. Verify it the same way Case
+will execute it: from the target repo cwd with shell semantics. The check should
+run the emitted `checkCommand` itself, not only inspect the task JSON or markdown
+artifact.
+
+Keep coverage for these runtime semantics:
+
+- A multi-word worker command such as `python3 -m fake_validation_worker`
+  remains split by the shell and is not treated as one executable path.
+- Relative wrapper state dirs still produce request paths that resolve from the
+  target repo cwd when the generated command runs.
+- The worker sees the target repo as `cwd` and can read the generated request
+  payload.
+
+`tests/test_run_bead_cli.py` contains the worker-backed fixture for this shape.
+
 ## Cron Shape
 
 The target cron entry is one bead per tick, with an external lock if needed:
