@@ -260,6 +260,78 @@ class ApplyCasePatchesScriptTest(unittest.TestCase):
             self.assertNotIn("ca status <task.json> status reviewing", reviewer_prompt)
             self.assertNotIn("ca status <task.json> status closing", closer_prompt)
 
+    def test_actual_case_patches_add_existing_pr_reuse_guidance_to_closer(self) -> None:
+        case_source = REPO_ROOT / ".external" / "workos-case"
+        if not case_source.is_dir():
+            self.skipTest("external workos/case checkout is not available")
+
+        first_patch = subprocess.run(
+            [
+                "git",
+                "rev-list",
+                "--max-count=1",
+                "--grep=feat(run): add runtime module injection",
+                "HEAD",
+            ],
+            cwd=case_source,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if first_patch.returncode != 0 or not first_patch.stdout.strip():
+            self.skipTest("external workos/case checkout does not include local patch commits")
+
+        with TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "case-checkout"
+            clone = subprocess.run(
+                ["git", "clone", "--quiet", str(case_source), str(checkout)],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(clone.returncode, 0, clone.stdout + clone.stderr)
+            self.git(checkout, "reset", "--hard", f"{first_patch.stdout.strip()}^")
+            self.git(checkout, "config", "user.email", "test@example.com")
+            self.git(checkout, "config", "user.name", "Test User")
+
+            result = subprocess.run(
+                [
+                    str(REPO_ROOT / "scripts" / "apply-case-patches.sh"),
+                    "--case-checkout",
+                    str(checkout),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            closer_prompt = (checkout / "agents" / "closer.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                'gh pr list --head "$BRANCH" --state open --json number,url',
+                closer_prompt,
+            )
+            self.assertIn(
+                "Do not run `gh pr create` when reusing an existing PR.",
+                closer_prompt,
+            )
+            self.assertIn("gh pr comment <number> --body", closer_prompt)
+            self.assertIn(
+                "If no open PR is found, use the normal `gh pr create` path.",
+                closer_prompt,
+            )
+            self.assertIn(
+                "If multiple open PRs match the current branch, fail clearly",
+                closer_prompt,
+            )
+
     def test_actual_case_patches_make_evidence_marker_help_non_mutating(self) -> None:
         case_source = REPO_ROOT / ".external" / "workos-case"
         if not case_source.is_dir():
