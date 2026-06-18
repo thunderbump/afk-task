@@ -1,0 +1,150 @@
+From ec81258d485a2c097eaaeb8647e883c846cc2e17 Mon Sep 17 00:00:00 2001
+From: Automation Workflow <agent@example.invalid>
+Date: Wed, 17 Jun 2026 21:36:30 -0700
+Subject: [PATCH] fix(prompts): reuse existing PRs during close
+
+---
+ agents/closer.md                     | 75 ++++++++++++++++++++++------
+ src/__tests__/package-assets.spec.ts | 13 +++++
+ 2 files changed, 73 insertions(+), 15 deletions(-)
+
+diff --git a/agents/closer.md b/agents/closer.md
+index 144fe21..f52cce9 100644
+--- a/agents/closer.md
++++ b/agents/closer.md
+@@ -2,3 +2,3 @@
+ name: closer
+-description: PR creation agent for /case. Drafts thorough PR descriptions from task file and verification evidence. Verifies all evidence gates before PR creation. Never implements or tests.
++description: PR owner for /case. Opens or reuses pull requests with thorough descriptions from task file and verification evidence. Verifies all evidence gates before PR actions. Never implements or tests.
+ tools: ['Read', 'Bash', 'Glob', 'Grep']
+@@ -6,5 +6,5 @@ tools: ['Read', 'Bash', 'Glob', 'Grep']
+ 
+-# Closer — PR Creation Agent
++# Closer — PR Agent
+ 
+-Create a pull request with a thorough description based on the task file, progress log, and verification evidence. You are the only agent that runs `gh pr create`. You must verify all evidence gates yourself before attempting to create the PR.
++Open or reuse a pull request with a thorough description based on the task file, progress log, and verification evidence. You are the only agent that owns PR open/reuse behavior and the only agent that runs `gh pr create` when a new PR is needed. You must verify all evidence gates yourself before attempting any PR action.
+ 
+@@ -108,3 +108,3 @@ Closes #<number>
+ 
+-Before running `gh pr create`, verify every requirement.
++Before running `gh pr create` or reusing an existing PR, verify every requirement.
+ 
+@@ -151,12 +151,55 @@ If any required check fails:
+ - Report exactly what's missing
+-- Do NOT attempt `gh pr create`
++- Do NOT attempt `gh pr create`, `gh pr comment`, or `git push`
+ - Set AGENT_RESULT status to `"failed"` with the missing requirement in `"error"`
+ 
+-### 4. Create PR
++### 4. Open or Reuse PR
++
++After evidence gates pass and branch safety is confirmed, check whether the current branch already has an open PR:
++
++```bash
++EXISTING_PRS=$(gh pr list --head "$BRANCH" --state open --json number,url)
++PR_COUNT=$(gh pr list --head "$BRANCH" --state open --json number,url --jq 'length')
++```
++
++- If exactly one open PR is found for the current branch:
++  - Extract `PR_NUMBER` and `PR_URL` from the existing PR.
++
++    ```bash
++    PR_NUMBER=$(gh pr list --head "$BRANCH" --state open --json number,url --jq '.[0].number')
++    PR_URL=$(gh pr list --head "$BRANCH" --state open --json number,url --jq '.[0].url')
++    ```
++
++  - Push the current branch so the existing PR includes the latest commits:
++
++    ```bash
++    git push -u origin "$BRANCH"
++    ```
++
++  - Add a non-destructive update comment with the new task summary and verification evidence. Do not overwrite the PR body unless the user explicitly asks.
++
++    ```bash
++    gh pr comment <number> --body "$(cat <<'EOF'
++    ## Case close update
++
++    <New task summary>
++
++    ## What was tested
++
++    <New automated/manual verification evidence>
++    EOF
++    )"
++    ```
++
++  - Do not run `gh pr create` when reusing an existing PR.
++- If no open PR is found, use the normal `gh pr create` path.
++- If multiple open PRs match the current branch, fail clearly instead of guessing which PR to update. Include the branch name and matching PRs in the error.
++
++For a new PR:
+ 
+ ```bash
+-gh pr create --title "<title>" --body "$(cat <<'EOF'
++PR_URL=$(gh pr create --title "<title>" --body "$(cat <<'EOF'
+ <PR body content>
+ EOF
+-)"
++)")
++PR_NUMBER=$(gh pr view "$PR_URL" --json number --jq '.number')
+ ```
+@@ -167,3 +210,3 @@ The body must contain verification keywords (any of: "verif", "tested", "test pl
+ 
+-If the reviewer produced warnings or info findings (check `.case/<task-slug>/reviewed` for `warnings` and `info` counts), post them as a PR review comment:
++If the reviewer produced warnings or info findings (check `.case/<task-slug>/reviewed` for `warnings` and `info` counts), post them as a PR review comment on the new or reused PR:
+ 
+@@ -190,3 +233,3 @@ Only post if there are actual findings to share. Skip this step if the reviewer
+ 
+-1. **Update task JSON** — set agent phase completed, then transition status and record PR URL:
++1. **Update task JSON** — set agent phase completed, then transition status and record PR URL/number:
+ 
+@@ -197,5 +240,6 @@ Only post if there are actual findings to share. Skip this step if the reviewer
+    ca status <task.json> prUrl "<PR URL>"
++   ca status <task.json> prNumber "<PR NUMBER>"
+    ```
+ 
+-   Extract the PR URL from the `gh pr create` output. A null `prUrl` makes the task record incomplete — this is not optional.
++   Use the PR URL and number from the existing PR reuse path or from the new PR create path. A null `prUrl` or `prNumber` makes the task record incomplete — this is not optional.
+ 
+@@ -206,3 +250,4 @@ Only post if there are actual findings to share. Skip this step if the reviewer
+ 
+-   - PR created: <PR URL>
++   - PR opened: <PR URL>
++   - PR number: <PR NUMBER>
+    - Title: <PR title>
+@@ -217,3 +262,3 @@ End your response with the structured result block:
+ <<<AGENT_RESULT
+-{"status":"completed","summary":"PR created: <url>","artifacts":{"commit":null,"filesChanged":[],"testsPassed":null,"screenshotUrls":[],"evidenceMarkers":[],"prUrl":"<url>","prNumber":<number>},"error":null}
++{"status":"completed","summary":"PR opened: <url>","artifacts":{"commit":null,"filesChanged":[],"testsPassed":null,"screenshotUrls":[],"evidenceMarkers":[],"prUrl":"<url>","prNumber":<number>},"error":null}
+ AGENT_RESULT>>>
+@@ -228,3 +273,3 @@ If pre-flight failed or `gh pr create` failed, set `"status":"failed"` and descr
+ - **Never run browser automation or manual tests.** The verifier already tested.
+-- **Always pre-flight before PR creation.** Catch missing evidence yourself with a clear error.
++- **Always pre-flight before PR actions.** Catch missing evidence yourself with a clear error.
+ - **Always include verification notes in the PR body.** Include verification keywords.
+@@ -233,2 +278,2 @@ If pre-flight failed or `gh pr create` failed, set `"status":"failed"` and descr
+ - **Always end with `<<<AGENT_RESULT` / `AGENT_RESULT>>>`.** The orchestrator depends on this.
+-- **Never push to main.** You're on a feature branch — `gh pr create` handles the push.
++- **Never push to main.** For reused PRs, push only the current feature branch; for new PRs, `gh pr create` handles the push.
+diff --git a/src/__tests__/package-assets.spec.ts b/src/__tests__/package-assets.spec.ts
+index 84599be..24dfefe 100644
+--- a/src/__tests__/package-assets.spec.ts
++++ b/src/__tests__/package-assets.spec.ts
+@@ -52,2 +52,15 @@ describe('package assets', () => {
+   });
++
++  it('guides the closer to reuse an existing open PR for the current branch', () => {
++    const packageRoot = resolve(import.meta.dir, '..', '..');
++    const prompt = readPackageAssetSync('agents/closer.md', { packageRoot });
++
++    expect(prompt).toContain('gh pr list --head "$BRANCH" --state open --json number,url');
++    expect(prompt).toContain('If exactly one open PR is found for the current branch');
++    expect(prompt).toContain('Do not run `gh pr create` when reusing an existing PR.');
++    expect(prompt).toContain('gh pr comment <number> --body');
++    expect(prompt).toContain('If no open PR is found, use the normal `gh pr create` path.');
++    expect(prompt).toContain('If multiple open PRs match the current branch, fail clearly');
++    expect(prompt).toContain('"prUrl":"<url>","prNumber":<number>');
++  });
+ });

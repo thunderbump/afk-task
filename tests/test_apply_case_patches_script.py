@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,6 +9,16 @@ import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_bun() -> str | None:
+    bun = shutil.which("bun")
+    if bun:
+        return bun
+    home_bun = Path.home() / ".bun" / "bin" / "bun"
+    if home_bun.is_file() and os.access(home_bun, os.X_OK):
+        return str(home_bun)
+    return None
 
 
 class ApplyCasePatchesScriptTest(unittest.TestCase):
@@ -178,3 +189,239 @@ class ApplyCasePatchesScriptTest(unittest.TestCase):
             bun_calls = bun_log.read_text(encoding="utf-8")
             self.assertIn(f"{checkout}:install", bun_calls)
             self.assertIn(f"{checkout}:run generate:assets", bun_calls)
+
+    def test_actual_case_patches_remove_phase_status_self_transitions(self) -> None:
+        case_source = REPO_ROOT / ".external" / "workos-case"
+        if not case_source.is_dir():
+            self.skipTest("external workos/case checkout is not available")
+
+        first_patch = subprocess.run(
+            [
+                "git",
+                "rev-list",
+                "--max-count=1",
+                "--grep=feat(run): add runtime module injection",
+                "HEAD",
+            ],
+            cwd=case_source,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if first_patch.returncode != 0 or not first_patch.stdout.strip():
+            self.skipTest("external workos/case checkout does not include local patch commits")
+
+        with TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "case-checkout"
+            clone = subprocess.run(
+                ["git", "clone", "--quiet", str(case_source), str(checkout)],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(clone.returncode, 0, clone.stdout + clone.stderr)
+            self.git(checkout, "reset", "--hard", f"{first_patch.stdout.strip()}^")
+            self.git(checkout, "config", "user.email", "test@example.com")
+            self.git(checkout, "config", "user.name", "Test User")
+
+            result = subprocess.run(
+                [
+                    str(REPO_ROOT / "scripts" / "apply-case-patches.sh"),
+                    "--case-checkout",
+                    str(checkout),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            implementer_prompt = (checkout / "agents" / "implementer.md").read_text(
+                encoding="utf-8"
+            )
+            verifier_prompt = (checkout / "agents" / "verifier.md").read_text(
+                encoding="utf-8"
+            )
+            reviewer_prompt = (checkout / "agents" / "reviewer.md").read_text(
+                encoding="utf-8"
+            )
+            closer_prompt = (checkout / "agents" / "closer.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(
+                "ca status <task.json> status implementing", implementer_prompt
+            )
+            self.assertNotIn("ca status <task.json> status verifying", verifier_prompt)
+            self.assertNotIn("ca status <task.json> status reviewing", reviewer_prompt)
+            self.assertNotIn("ca status <task.json> status closing", closer_prompt)
+
+    def test_actual_case_patches_add_existing_pr_reuse_guidance_to_closer(self) -> None:
+        case_source = REPO_ROOT / ".external" / "workos-case"
+        if not case_source.is_dir():
+            self.skipTest("external workos/case checkout is not available")
+
+        first_patch = subprocess.run(
+            [
+                "git",
+                "rev-list",
+                "--max-count=1",
+                "--grep=feat(run): add runtime module injection",
+                "HEAD",
+            ],
+            cwd=case_source,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if first_patch.returncode != 0 or not first_patch.stdout.strip():
+            self.skipTest("external workos/case checkout does not include local patch commits")
+
+        with TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "case-checkout"
+            clone = subprocess.run(
+                ["git", "clone", "--quiet", str(case_source), str(checkout)],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(clone.returncode, 0, clone.stdout + clone.stderr)
+            self.git(checkout, "reset", "--hard", f"{first_patch.stdout.strip()}^")
+            self.git(checkout, "config", "user.email", "test@example.com")
+            self.git(checkout, "config", "user.name", "Test User")
+
+            result = subprocess.run(
+                [
+                    str(REPO_ROOT / "scripts" / "apply-case-patches.sh"),
+                    "--case-checkout",
+                    str(checkout),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            closer_prompt = (checkout / "agents" / "closer.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                'gh pr list --head "$BRANCH" --state open --json number,url',
+                closer_prompt,
+            )
+            self.assertIn(
+                "Do not run `gh pr create` when reusing an existing PR.",
+                closer_prompt,
+            )
+            self.assertIn("gh pr comment <number> --body", closer_prompt)
+            self.assertIn(
+                "If no open PR is found, use the normal `gh pr create` path.",
+                closer_prompt,
+            )
+            self.assertIn(
+                "If multiple open PRs match the current branch, fail clearly",
+                closer_prompt,
+            )
+
+    def test_actual_case_patches_make_evidence_marker_help_non_mutating(self) -> None:
+        case_source = REPO_ROOT / ".external" / "workos-case"
+        if not case_source.is_dir():
+            self.skipTest("external workos/case checkout is not available")
+        case_node_modules = case_source / "node_modules"
+        if not case_node_modules.is_dir():
+            self.skipTest("external workos/case checkout dependencies are not installed")
+        bun = resolve_bun()
+        if bun is None:
+            self.skipTest("bun is not available")
+        bun_env = os.environ.copy()
+        bun_env["PATH"] = f"{Path(bun).parent}:{bun_env.get('PATH', '')}"
+
+        first_patch = subprocess.run(
+            [
+                "git",
+                "rev-list",
+                "--max-count=1",
+                "--grep=feat(run): add runtime module injection",
+                "HEAD",
+            ],
+            cwd=case_source,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if first_patch.returncode != 0 or not first_patch.stdout.strip():
+            self.skipTest("external workos/case checkout does not include local patch commits")
+
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            checkout = tmp_path / "case-checkout"
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            clone = subprocess.run(
+                ["git", "clone", "--quiet", str(case_source), str(checkout)],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(clone.returncode, 0, clone.stdout + clone.stderr)
+            os.symlink(case_node_modules, checkout / "node_modules", target_is_directory=True)
+            self.git(checkout, "reset", "--hard", f"{first_patch.stdout.strip()}^")
+            self.git(checkout, "config", "user.email", "test@example.com")
+            self.git(checkout, "config", "user.name", "Test User")
+
+            result = subprocess.run(
+                [
+                    str(REPO_ROOT / "scripts" / "apply-case-patches.sh"),
+                    "--case-checkout",
+                    str(checkout),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            assets = subprocess.run(
+                [bun, "run", "generate:assets"],
+                cwd=checkout,
+                env=bun_env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(assets.returncode, 0, assets.stdout + assets.stderr)
+
+            for command in ["mark-tested", "mark-manual-tested", "mark-reviewed"]:
+                help_result = subprocess.run(
+                    [bun, str(checkout / "src" / "index.ts"), command, "--help"],
+                    cwd=repo,
+                    env=bun_env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+                self.assertEqual(
+                    help_result.returncode,
+                    0,
+                    f"{command} help failed\nstdout:\n{help_result.stdout}\nstderr:\n{help_result.stderr}",
+                )
+                self.assertIn(f"Usage: ca {command}", help_result.stdout)
+                self.assertNotIn("REFUSED", help_result.stderr)
+                self.assertNotIn("ERROR:", help_result.stderr)
+                self.assertFalse((repo / ".case").exists(), f"{command} help mutated repo state")

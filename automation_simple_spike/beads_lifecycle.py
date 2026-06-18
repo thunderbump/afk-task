@@ -22,6 +22,17 @@ class BeadsLifecycleError(RuntimeError):
     pass
 
 
+def validation_failure_comment_lines(run: "LifecycleRun") -> list[str]:
+    lines: list[str] = []
+    if run.validation_worker_status:
+        lines.append(f"Validation worker status: {run.validation_worker_status}")
+    if run.validation_failure_category:
+        lines.append(f"Validation failure category: {run.validation_failure_category}")
+    if run.validation_evidence_path is not None:
+        lines.append(f"Validation evidence: {run.validation_evidence_path}")
+    return lines
+
+
 @dataclass(frozen=True)
 class LifecycleRun:
     bead_id: str
@@ -32,6 +43,9 @@ class LifecycleRun:
     target_source_checkout: Path
     target_worktree_checkout: Path | None
     archive_path: Path
+    validation_evidence_path: Path | None = None
+    validation_worker_status: str | None = None
+    validation_failure_category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -68,14 +82,30 @@ class BeadsLifecycleClient:
         close_bead: bool,
     ) -> None:
         args = ["update", run.bead_id]
-        for key, value in [
+        metadata = [
             ("last_afk_run_id", run.run_id),
             ("last_afk_run_result", "success"),
             ("last_afk_run_exit_code", str(interpreted_exit_code)),
             ("last_afk_run_commit", commit_sha),
             ("last_afk_run_branch", run.review_branch),
             ("last_afk_run_archive_path", str(run.archive_path)),
-        ]:
+        ]
+        if run.validation_evidence_path is not None:
+            metadata.append(
+                ("last_afk_validation_evidence_path", str(run.validation_evidence_path))
+            )
+        if run.validation_worker_status:
+            metadata.append(
+                ("last_afk_validation_worker_status", run.validation_worker_status)
+            )
+        if run.validation_failure_category:
+            metadata.append(
+                (
+                    "last_afk_validation_failure_category",
+                    run.validation_failure_category,
+                )
+            )
+        for key, value in metadata:
             args.extend(["--set-metadata", f"{key}={value}"])
         for key in ACTIVE_RUN_METADATA_KEYS:
             args.extend(["--unset-metadata", key])
@@ -97,7 +127,13 @@ class BeadsLifecycleClient:
         *,
         interpreted_exit_code: int,
         failure_summary: str,
+        next_action: str | None = None,
     ) -> None:
+        if next_action is None:
+            next_action = (
+                "inspect case-stdout.txt and case-stderr.txt in the archive, fix "
+                "the failure, then rerun when ready."
+            )
         comment = "\n".join(
             [
                 "AFK run failed.",
@@ -107,24 +143,38 @@ class BeadsLifecycleClient:
                 f"Archive: {run.archive_path}",
                 f"Exit code: {interpreted_exit_code}",
                 f"Failure: {failure_summary}",
+                *validation_failure_comment_lines(run),
                 "",
-                (
-                    "Next action: inspect case-stdout.txt and case-stderr.txt in the "
-                    "archive, fix the failure, then rerun when ready."
-                ),
+                f"Next action: {next_action}",
                 "",
             ]
         )
         self.run_bd(["comment", run.bead_id, "--stdin"], input_text=comment)
 
         args = ["update", run.bead_id]
-        for key, value in [
+        metadata = [
             ("last_afk_run_id", run.run_id),
             ("last_afk_run_result", "failure"),
             ("last_afk_run_exit_code", str(interpreted_exit_code)),
             ("last_afk_run_branch", run.review_branch),
             ("last_afk_run_archive_path", str(run.archive_path)),
-        ]:
+        ]
+        if run.validation_evidence_path is not None:
+            metadata.append(
+                ("last_afk_validation_evidence_path", str(run.validation_evidence_path))
+            )
+        if run.validation_worker_status:
+            metadata.append(
+                ("last_afk_validation_worker_status", run.validation_worker_status)
+            )
+        if run.validation_failure_category:
+            metadata.append(
+                (
+                    "last_afk_validation_failure_category",
+                    run.validation_failure_category,
+                )
+            )
+        for key, value in metadata:
             args.extend(["--set-metadata", f"{key}={value}"])
         for key in ACTIVE_RUN_METADATA_KEYS:
             args.extend(["--unset-metadata", key])

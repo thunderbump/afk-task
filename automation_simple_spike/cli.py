@@ -6,13 +6,15 @@ import binascii
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .beads_env import beads_subprocess_env
 from .workstream_context import (
@@ -22,7 +24,17 @@ from .workstream_context import (
     render_workstream_context_markdown,
 )
 from .beads_lifecycle import BeadsLifecycleClient, BeadsLifecycleError, LifecycleRun
-from .worktree import WorktreeProvisioningError, provision_target_worktree
+from .validation_metadata import (
+    has_validation_metadata,
+    is_worker_validation_requested,
+    worker_metadata_value,
+    worker_validation_command,
+)
+from .worktree import (
+    WorktreeProvisioningError,
+    provision_target_worktree,
+    resolve_start_ref,
+)
 
 
 REQUIRED_METADATA = [
@@ -32,14 +44,26 @@ REQUIRED_METADATA = [
     "target_repo_path",
     "target_base_branch",
     "branch_policy",
-    "validation_command",
 ]
 
 CODEX_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
 CODEX_TOKEN_EXPIRY_MARGIN_SECONDS = 300
+CASE_ENV_REMOVED_KEYS = (
+    "BEADS_DIR",
+    "BEADS_DOLT_PASSWORD",
+    "AUTOMATION_BEADS_WORKSPACE",
+    "OPENAI_API_KEY",
+    "PI_CODING_AGENT_DIR",
+)
+GITHUB_TOKEN_ENV_KEYS = ("GH_TOKEN", "GITHUB_TOKEN")
+DEFAULT_CASE_COMMAND = "bun"
 
 
 class TargetRepoPreparationError(ValueError):
+    pass
+
+
+class GithubTargetRepoResolutionError(ValueError):
     pass
 
 
@@ -50,6 +74,22 @@ class CaseCodexSession:
     model: str
     pi_config_dir: Path
     scout_only: bool
+
+
+@dataclass(frozen=True)
+class GithubPrPreflightFailure:
+    kind: str
+    message: str
+
+
+@dataclass(frozen=True)
+class GithubTargetRepoResolution:
+    metadata_repo: str
+    canonical_repo: str
+    remote_name: str
+    remote_repo: str
+    sanitized_remote_url: str
+    source: str
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -72,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to the patched workos/case checkout. Defaults to CASE_CHECKOUT.",
     )
     run.add_argument("--case-data-dir")
-    run.add_argument("--case-command", default="bun")
+    run.add_argument("--case-command")
     run.add_argument("--case-dry-run", action="store_true")
     run.add_argument("--case-runtime-module")
     run.add_argument(
@@ -102,7 +142,14 @@ def main(argv: list[str] | None = None) -> int:
         default="/home/bump/Projects/beads/secrets/dolt_beads_password.txt",
     )
     run.add_argument("--beads-lifecycle", action="store_true")
-    run.add_argument("--close-bead-on-success", action="store_true")
+    run.add_argument(
+        "--close-bead-on-success",
+        action="store_true",
+        help=(
+            "Close the Bead after Case succeeds; preflights GitHub CLI PR "
+            "capability before launching Case."
+        ),
+    )
 
     select = subparsers.add_parser("select-workstream")
     select_scope = select.add_mutually_exclusive_group(required=True)
@@ -126,13 +173,20 @@ def main(argv: list[str] | None = None) -> int:
         "--workstream-json",
         help="Optional fixture JSON with parent/workstream issue records.",
     )
+    run_workstream_parser.add_argument(
+        "--workstream-seed-ref",
+        help=(
+            "Existing branch, ref, commit, or GitHub PR URL used to seed "
+            "the first shared-sequential review branch."
+        ),
+    )
     run_workstream_parser.add_argument("--state-dir", default=".automation-simple")
     run_workstream_parser.add_argument(
         "--case-checkout",
         help="Path to the patched workos/case checkout. Defaults to CASE_CHECKOUT.",
     )
     run_workstream_parser.add_argument("--case-data-dir")
-    run_workstream_parser.add_argument("--case-command", default="bun")
+    run_workstream_parser.add_argument("--case-command")
     run_workstream_parser.add_argument("--case-dry-run", action="store_true")
     run_workstream_parser.add_argument("--case-runtime-module")
     run_workstream_parser.add_argument(
@@ -165,7 +219,14 @@ def main(argv: list[str] | None = None) -> int:
         default="/home/bump/Projects/beads/secrets/dolt_beads_password.txt",
     )
     run_workstream_parser.add_argument("--beads-lifecycle", action="store_true")
-    run_workstream_parser.add_argument("--close-bead-on-success", action="store_true")
+    run_workstream_parser.add_argument(
+        "--close-bead-on-success",
+        action="store_true",
+        help=(
+            "Close each Bead after Case succeeds; preflights GitHub CLI PR "
+            "capability before launching Case."
+        ),
+    )
     run_workstream_parser.add_argument(
         "--skip-final-validation",
         action="store_true",
@@ -222,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
             workstream_json=(
                 Path(args.workstream_json) if args.workstream_json else None
             ),
+            workstream_seed_ref=args.workstream_seed_ref,
             state_dir=Path(args.state_dir),
             case_checkout=configured_case_checkout(args.case_checkout),
             case_data_dir=Path(args.case_data_dir) if args.case_data_dir else None,
@@ -266,7 +328,7 @@ def run_bead(
     state_dir: Path,
     case_checkout: Path | None,
     case_data_dir: Path | None,
-    case_command: str,
+    case_command: str | None,
     case_dry_run: bool,
     case_runtime_module: Path | None,
     target_checkout_mode: str,
@@ -281,6 +343,7 @@ def run_bead(
     beads_lifecycle: bool,
     close_bead_on_success: bool,
     skip_target_preparation: bool = False,
+    workstream_seed_ref: str | None = None,
 ) -> int:
     if close_bead_on_success and not beads_lifecycle:
         print(
@@ -354,13 +417,99 @@ def run_bead(
             file=sys.stderr,
         )
         return 1
+    resolved_case_command = resolve_case_command(case_command)
+    if resolved_case_command is None:
+        case_command_description = case_command or DEFAULT_CASE_COMMAND
+        print(
+            "run-bead missing Case command: "
+            f"{case_command_description} was not found; pass "
+            "--case-command /path/to/bun or add Bun to PATH",
+            file=sys.stderr,
+        )
+        return 1
 
     metadata = issue["metadata"]
+    issue_for_run = issue
     target_source_checkout = Path(str(metadata["target_repo_path"])).resolve()
     target_repo = target_source_checkout
     target_worktree_checkout = None
+    workstream_seed_commit = None
     case_data = case_data_dir or state_dir / "case-data"
     review_branch = review_branch_for(bead_id=bead_id, metadata=metadata)
+    planned_case_cli_shim = case_cli_shim_path(state_dir)
+    target_repo_name = str(metadata["target_repo"])
+    if close_bead_on_success:
+        try:
+            target_repo_resolution = resolve_github_target_repo(
+                metadata_repo=target_repo_name,
+                target_checkout=target_source_checkout,
+            )
+        except GithubTargetRepoResolutionError as error:
+            preflight_failure = GithubPrPreflightFailure(
+                kind="invalid-target-repo-remote",
+                message=str(error),
+            )
+        else:
+            target_repo_name = target_repo_resolution.canonical_repo
+            issue_for_run = issue_with_resolved_target_repo(
+                issue,
+                target_repo_resolution,
+            )
+            metadata = issue_for_run["metadata"]
+            preflight_env = build_case_command_env(
+                case_data_dir=case_data,
+                case_cli_shim=planned_case_cli_shim,
+                codex_session=codex_session,
+            )
+            preflight_failure = github_pr_preflight_failure(
+                target_repo=target_repo_name,
+                env=preflight_env,
+            )
+        if preflight_failure is not None:
+            run_id = make_run_id(bead_id)
+            run_dir = state_dir / "runs" / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            write_github_pr_preflight_failure(
+                run_dir=run_dir,
+                target_repo=target_repo_name,
+                failure=preflight_failure,
+            )
+            if lifecycle_client is not None:
+                lifecycle_run = LifecycleRun(
+                    bead_id=bead_id,
+                    run_id=run_id,
+                    review_branch=review_branch,
+                    target_checkout_mode=target_checkout_mode,
+                    target_checkout_path=target_repo,
+                    target_source_checkout=target_source_checkout,
+                    target_worktree_checkout=None,
+                    archive_path=run_dir,
+                )
+                try:
+                    lifecycle_client.record_failure(
+                        lifecycle_run,
+                        interpreted_exit_code=1,
+                        failure_summary=(
+                            "GitHub PR preflight failed: "
+                            f"{preflight_failure.message}"
+                        ),
+                        next_action=(
+                            "Fix GitHub CLI authentication or repo access, then "
+                            "rerun. Case was not started."
+                        ),
+                    )
+                except BeadsLifecycleError as error:
+                    print(
+                        "run-bead lifecycle preflight failure update failed: "
+                        f"{error}",
+                        file=sys.stderr,
+                    )
+            print(
+                "run-bead GitHub PR preflight failed: "
+                f"{preflight_failure.message}",
+                file=sys.stderr,
+            )
+            return 1
     try:
         if skip_target_preparation:
             git_dir = run_target_git(target_repo, "rev-parse", "--git-dir")
@@ -375,30 +524,51 @@ def run_bead(
                 or state_dir / "target-worktrees",
                 base_branch=str(metadata["target_base_branch"]),
                 review_branch=review_branch,
+                start_ref=workstream_seed_ref,
             )
             target_source_checkout = provisioned.source_checkout
             target_repo = provisioned.worktree_checkout
             target_worktree_checkout = provisioned.worktree_checkout
+            workstream_seed_commit = (
+                provisioned.start_commit if workstream_seed_ref is not None else None
+            )
         else:
-            prepare_target_review_branch(
+            workstream_seed_commit = prepare_target_review_branch(
                 target_repo=target_repo,
                 base_branch=str(metadata["target_base_branch"]),
                 review_branch=review_branch,
+                start_ref=workstream_seed_ref,
             )
+            if workstream_seed_ref is None:
+                workstream_seed_commit = None
     except (TargetRepoPreparationError, WorktreeProvisioningError) as error:
         print(f"run-bead target repo invalid: {error}", file=sys.stderr)
         return 1
+    run_dir = state_dir.resolve() / "runs" / make_run_id(bead_id)
+    try:
+        validation_command = compile_validation_metadata(
+            issue=issue_for_run,
+            state_dir=state_dir,
+            review_branch=review_branch,
+            target_checkout_path=target_repo,
+            target_source_checkout=target_source_checkout,
+            target_worktree_checkout=target_worktree_checkout,
+            run_dir=run_dir,
+        )
+    except ValueError as error:
+        print(f"run-bead validation metadata invalid: {error}", file=sys.stderr)
+        return 1
     task_md, task_json = write_case_task(
-        issue=issue,
+        issue=issue_for_run,
         target_repo=target_repo,
         review_branch=review_branch,
         workstream_context=workstream_context,
     )
     write_case_projects_manifest(
         case_data_dir=case_data,
-        repo_name=str(metadata["target_repo"]),
+        repo_name=target_repo_name,
         repo_path=target_repo,
-        validation_command=str(metadata["validation_command"]),
+        validation_command=validation_command,
         codex_session=codex_session,
     )
     if codex_session is not None:
@@ -406,10 +576,11 @@ def run_bead(
     case_cli_shim = write_case_cli_shim(
         state_dir=state_dir,
         case_checkout=case_checkout,
+        case_command=resolved_case_command,
     )
     request_path = write_execution_request(
         state_dir=state_dir,
-        issue=issue,
+        issue=issue_for_run,
         task_md=task_md,
         task_json=task_json,
         case_checkout=case_checkout,
@@ -423,6 +594,9 @@ def run_bead(
         target_source_checkout=target_source_checkout,
         target_worktree_checkout=target_worktree_checkout,
         codex_session=codex_session,
+        workstream_seed_ref=workstream_seed_ref,
+        workstream_seed_commit=workstream_seed_commit,
+        run_dir=run_dir,
     )
     lifecycle_run = None
     if lifecycle_client is not None:
@@ -435,6 +609,7 @@ def run_bead(
             target_source_checkout=target_source_checkout,
             target_worktree_checkout=target_worktree_checkout,
             archive_path=request_path.parent,
+            validation_evidence_path=validation_evidence_path(issue_for_run),
         )
         try:
             lifecycle_client.record_start(lifecycle_run)
@@ -443,7 +618,7 @@ def run_bead(
             return 1
     generated_task_json = task_json.read_text(encoding="utf-8") if case_dry_run else None
     result = run_case_command(
-        case_command=case_command,
+        case_command=resolved_case_command,
         case_checkout=case_checkout,
         case_data_dir=case_data,
         case_cli_shim=case_cli_shim,
@@ -451,6 +626,12 @@ def run_bead(
         case_dry_run=case_dry_run,
         case_runtime_module=case_runtime_module,
         codex_session=codex_session,
+    )
+    redactions = case_command_redactions(codex_session)
+    archive_case_artifacts(
+        run_dir=request_path.parent,
+        target_repo=target_repo,
+        redactions=redactions,
     )
     if case_dry_run and generated_task_json is not None:
         preserve_native_dry_run_task(
@@ -463,10 +644,12 @@ def run_bead(
         request_path.parent,
         result,
         interpreted_returncode,
-        redactions=([codex_session.access_token] if codex_session is not None else None),
+        redactions=redactions,
     )
     if interpreted_returncode != 0:
         failure_summary = case_failure_summary(result)
+        if lifecycle_run is not None:
+            lifecycle_run = lifecycle_run_with_validation_result(lifecycle_run)
         if lifecycle_client is not None and lifecycle_run is not None:
             try:
                 lifecycle_client.record_failure(
@@ -485,7 +668,7 @@ def run_bead(
     if lifecycle_client is not None and lifecycle_run is not None:
         try:
             lifecycle_client.record_success(
-                lifecycle_run,
+                lifecycle_run_with_validation_result(lifecycle_run),
                 commit_sha=target_head_commit(target_repo),
                 interpreted_exit_code=interpreted_returncode,
                 close_bead=close_bead_on_success,
@@ -704,6 +887,11 @@ def eligibility_rejections(issue: dict[str, Any]) -> list[str]:
     for field in REQUIRED_METADATA:
         if field not in metadata or metadata[field] in ("", None):
             reasons.append(f"missing metadata {field}")
+    if is_worker_validation_requested(metadata):
+        if worker_validation_command(metadata) is None:
+            reasons.append("missing metadata worker_command")
+    elif not has_validation_metadata(metadata):
+        reasons.append("missing metadata validation_command")
 
     if "afk_enabled" in metadata and metadata.get("afk_enabled") is not True:
         reasons.append("invalid metadata afk_enabled: expected true")
@@ -742,6 +930,155 @@ def eligibility_rejections(issue: dict[str, Any]) -> list[str]:
     return reasons
 
 
+def compile_validation_metadata(
+    *,
+    issue: dict[str, Any],
+    state_dir: Path,
+    review_branch: str,
+    target_checkout_path: Path,
+    target_source_checkout: Path,
+    target_worktree_checkout: Path | None,
+    run_dir: Path | None = None,
+) -> str:
+    metadata = issue["metadata"]
+    if not is_worker_validation_requested(metadata):
+        return str(metadata["validation_command"])
+
+    command = worker_validation_command(metadata)
+    if command is None:
+        raise ValueError("worker validation requires worker_command")
+
+    request_path = write_validation_worker_request(
+        issue=issue,
+        state_dir=state_dir,
+        review_branch=review_branch,
+        target_checkout_path=target_checkout_path,
+        target_source_checkout=target_source_checkout,
+        target_worktree_checkout=target_worktree_checkout,
+        run_dir=run_dir,
+    )
+    compiled = f"{command} --request {shlex.quote(str(request_path))}"
+    metadata["validation_command"] = compiled
+    return compiled
+
+
+def write_validation_worker_request(
+    *,
+    issue: dict[str, Any],
+    state_dir: Path,
+    review_branch: str,
+    target_checkout_path: Path,
+    target_source_checkout: Path,
+    target_worktree_checkout: Path | None,
+    run_dir: Path | None = None,
+) -> Path:
+    metadata = issue["metadata"]
+    request_dir = state_dir.resolve() / "validation-requests"
+    request_dir.mkdir(parents=True, exist_ok=True)
+    request_path = request_dir / f"{issue['id']}.json"
+    evidence_dir = validation_evidence_dir_for(
+        state_dir=state_dir,
+        run_dir=run_dir,
+        bead_id=str(issue["id"]),
+    )
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "bead_id": issue["id"],
+        "mode": worker_metadata_value(
+            metadata,
+            flat_keys="validation_mode",
+            worker_keys="mode",
+            default="worker",
+        )
+        or "worker",
+        "profile": worker_metadata_value(
+            metadata,
+            flat_keys="validation_profile",
+            worker_keys="profile",
+        ),
+        "timeout_seconds": worker_metadata_value(
+            metadata,
+            flat_keys="validation_timeout_seconds",
+            worker_keys="timeout_seconds",
+        ),
+        "repo": worker_metadata_value(
+            metadata,
+            flat_keys="validation_repo",
+            worker_keys="repo",
+            default=metadata["target_repo"],
+        )
+        or metadata["target_repo"],
+        "ref": worker_metadata_value(
+            metadata,
+            flat_keys="validation_ref",
+            worker_keys="ref",
+        ),
+        "commit": worker_metadata_value(
+            metadata,
+            flat_keys="validation_commit",
+            worker_keys="commit",
+        ),
+        "evidence_dir": str(evidence_dir),
+        "target_repo": metadata["target_repo"],
+        "target_repo_path": metadata["target_repo_path"],
+        "target_base_branch": metadata["target_base_branch"],
+        "target_checkout_path": str(target_checkout_path),
+        "target_source_checkout": str(target_source_checkout),
+        "target_worktree_checkout": (
+            str(target_worktree_checkout)
+            if target_worktree_checkout is not None
+            else None
+        ),
+        "review_branch": review_branch,
+    }
+    request_path.write_text(
+        redact_sensitive_text(json.dumps(payload, indent=2, sort_keys=True)) + "\n",
+        encoding="utf-8",
+    )
+    metadata["validation_worker_evidence_dir"] = str(evidence_dir)
+    metadata["validation_worker_request_path"] = str(request_path)
+    return request_path
+
+
+def validation_evidence_dir_for(
+    *, state_dir: Path, run_dir: Path | None, bead_id: str
+) -> Path:
+    if run_dir is not None:
+        return run_dir.resolve() / "validation-evidence"
+    return state_dir.resolve() / "runs" / make_run_id(bead_id) / "validation-evidence"
+
+
+def validation_evidence_path(issue: dict[str, Any]) -> Path | None:
+    path = issue.get("metadata", {}).get("validation_worker_evidence_dir")
+    if isinstance(path, str) and path:
+        return Path(path)
+    return None
+
+
+def lifecycle_run_with_validation_result(run: LifecycleRun) -> LifecycleRun:
+    if run.validation_evidence_path is None:
+        return run
+    result_path = run.validation_evidence_path / "result.json"
+    if not result_path.is_file():
+        return replace(run, validation_worker_status="missing_result")
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return replace(run, validation_worker_status="invalid_result")
+    if not isinstance(payload, dict):
+        return replace(run, validation_worker_status="invalid_result")
+
+    status = payload.get("status") or payload.get("result") or payload.get("outcome")
+    category = payload.get("failure_category") or payload.get("category")
+    return replace(
+        run,
+        validation_worker_status=str(status) if status not in (None, "") else None,
+        validation_failure_category=(
+            str(category) if category not in (None, "") else None
+        ),
+    )
+
+
 def review_branch_for(*, bead_id: str, metadata: dict[str, Any]) -> str:
     branch_policy = metadata["branch_policy"]
     if branch_policy == "independent":
@@ -754,7 +1091,8 @@ def prepare_target_review_branch(
     target_repo: Path,
     base_branch: str,
     review_branch: str,
-) -> None:
+    start_ref: str | None = None,
+) -> str:
     git_dir = run_target_git(target_repo, "rev-parse", "--git-dir")
     if git_dir.returncode != 0:
         raise TargetRepoPreparationError(f"{target_repo} is not a git repository")
@@ -781,12 +1119,42 @@ def prepare_target_review_branch(
             f"target base branch does not exist locally: {base_branch}"
         )
 
-    checkout = run_target_git(target_repo, "checkout", "-B", review_branch, base_branch)
+    if start_ref is None:
+        effective_start_ref = base_branch
+        start = run_target_git(
+            target_repo,
+            "rev-parse",
+            "--verify",
+            f"{effective_start_ref}^{{commit}}",
+        )
+        if start.returncode != 0:
+            raise TargetRepoPreparationError(
+                f"target base branch does not resolve to a commit: "
+                f"{effective_start_ref}"
+            )
+        start_commit = start.stdout.strip()
+    else:
+        resolved_start_ref = resolve_start_ref(
+            target_repo,
+            start_ref,
+            label="workstream seed ref",
+        )
+        effective_start_ref = resolved_start_ref.ref
+        start_commit = resolved_start_ref.commit
+
+    checkout = run_target_git(
+        target_repo,
+        "checkout",
+        "-B",
+        review_branch,
+        effective_start_ref,
+    )
     if checkout.returncode != 0:
         raise TargetRepoPreparationError(
-            f"could not reset review branch {review_branch} to {base_branch}: "
+            f"could not reset review branch {review_branch} to {effective_start_ref}: "
             f"{git_error_message(checkout)}"
         )
+    return start_commit
 
 
 def run_target_git(target_repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -810,6 +1178,142 @@ def run_target_git(target_repo: Path, *args: str) -> subprocess.CompletedProcess
 
 def git_error_message(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stderr or result.stdout).strip() or f"git exited {result.returncode}"
+
+
+def resolve_github_target_repo(
+    *, metadata_repo: str, target_checkout: Path
+) -> GithubTargetRepoResolution:
+    remote_name = "origin"
+    remote_result = run_target_git(target_checkout, "remote", "get-url", remote_name)
+    if remote_result.returncode != 0:
+        raise GithubTargetRepoResolutionError(
+            f"target checkout {target_checkout} does not have an {remote_name} "
+            "remote; add an origin remote that points at GitHub before using "
+            "--close-bead-on-success. git remote get-url origin: "
+            f"{git_error_message(remote_result)}"
+        )
+
+    remote_url = remote_result.stdout.strip()
+    sanitized_remote_url = sanitize_git_remote_url(remote_url)
+    remote_repo = github_repo_from_remote_url(remote_url)
+    if remote_repo is None:
+        raise GithubTargetRepoResolutionError(
+            f"target checkout {target_checkout} {remote_name} remote is not a "
+            f"GitHub repository ({sanitized_remote_url}); update the checkout "
+            "remote or disable --close-bead-on-success"
+        )
+
+    requested_repo = metadata_repo.strip()
+    if is_canonical_github_repo(requested_repo):
+        if requested_repo.lower() != remote_repo.lower():
+            raise GithubTargetRepoResolutionError(
+                f"metadata target_repo={requested_repo!r} does not match "
+                f"{remote_name} remote GitHub repo {remote_repo!r}; update "
+                "Beads target_repo or use the checkout for that repository"
+            )
+        return GithubTargetRepoResolution(
+            metadata_repo=requested_repo,
+            canonical_repo=requested_repo,
+            remote_name=remote_name,
+            remote_repo=remote_repo,
+            sanitized_remote_url=sanitized_remote_url,
+            source="metadata",
+        )
+
+    return GithubTargetRepoResolution(
+        metadata_repo=requested_repo,
+        canonical_repo=remote_repo,
+        remote_name=remote_name,
+        remote_repo=remote_repo,
+        sanitized_remote_url=sanitized_remote_url,
+        source="origin-remote",
+    )
+
+
+def is_canonical_github_repo(value: str) -> bool:
+    parts = value.split("/")
+    if len(parts) != 2:
+        return False
+    owner, repo = parts
+    return is_github_owner(owner) and is_github_repo_name(repo)
+
+
+def is_github_owner(value: str) -> bool:
+    if not value or len(value) > 39:
+        return False
+    if not value[0].isalnum() or not value[-1].isalnum():
+        return False
+    return all(character.isalnum() or character == "-" for character in value)
+
+
+def is_github_repo_name(value: str) -> bool:
+    if not value or value in {".", ".."} or value.endswith(".git"):
+        return False
+    return all(
+        character.isalnum() or character in {".", "_", "-"} for character in value
+    )
+
+
+def github_repo_from_remote_url(remote_url: str) -> str | None:
+    remote_url = remote_url.strip()
+    if not remote_url:
+        return None
+
+    if "://" in remote_url:
+        parsed = urlsplit(remote_url)
+        if (parsed.hostname or "").lower() != "github.com":
+            return None
+        path = parsed.path
+    else:
+        host, separator, path = remote_url.partition(":")
+        if not separator:
+            return None
+        host = host.rsplit("@", 1)[-1]
+        if host.lower() != "github.com":
+            return None
+
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) != 2:
+        return None
+    owner, repo = parts
+    if not is_github_owner(owner) or not is_github_repo_name(repo):
+        return None
+    return f"{owner}/{repo}"
+
+
+def sanitize_git_remote_url(remote_url: str) -> str:
+    remote_url = remote_url.strip()
+    if "://" in remote_url:
+        parsed = urlsplit(remote_url)
+        netloc = parsed.hostname or ""
+        if parsed.port is not None:
+            netloc = f"{netloc}:{parsed.port}"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+    host, separator, path = remote_url.partition(":")
+    if separator and "@" in host:
+        return f"{host.rsplit('@', 1)[-1]}:{path}"
+    return remote_url
+
+
+def issue_with_resolved_target_repo(
+    issue: dict[str, Any], resolution: GithubTargetRepoResolution
+) -> dict[str, Any]:
+    resolved_issue = dict(issue)
+    metadata = dict(issue["metadata"])
+    metadata["target_repo"] = resolution.canonical_repo
+    metadata["target_repo_metadata"] = resolution.metadata_repo
+    metadata["target_repo_resolution"] = {
+        "source": resolution.source,
+        "remote_name": resolution.remote_name,
+        "remote_repo": resolution.remote_repo,
+        "remote_url": resolution.sanitized_remote_url,
+    }
+    resolved_issue["metadata"] = metadata
+    return resolved_issue
 
 
 def target_head_commit(target_repo: Path) -> str:
@@ -842,8 +1346,10 @@ def write_case_task(
 ) -> tuple[Path, Path]:
     metadata = issue["metadata"]
     bead_id = str(issue["id"])
-    task_dir = target_repo / ".case" / "tasks" / "active"
+    case_dir = target_repo / ".case"
+    task_dir = case_dir / "tasks" / "active"
     task_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / "active").write_text(f"{bead_id}\n", encoding="utf-8")
     task_md = task_dir / f"{bead_id}.md"
     task_json = task_dir / f"{bead_id}.task.json"
     validation_command = redact_sensitive_text(str(metadata["validation_command"]))
@@ -985,17 +1491,20 @@ def write_case_projects_manifest(
     return projects_path
 
 
-def write_case_cli_shim(*, state_dir: Path, case_checkout: Path) -> Path:
-    shim_dir = state_dir / "case-bin"
+def write_case_cli_shim(
+    *, state_dir: Path, case_checkout: Path, case_command: str
+) -> Path:
+    shim_path = case_cli_shim_path(state_dir)
+    shim_dir = shim_path.parent
     shim_dir.mkdir(parents=True, exist_ok=True)
-    shim_path = shim_dir / "ca"
     shim_path.write_text(
         "\n".join(
             [
                 "#!/usr/bin/env sh",
                 "set -eu",
                 f"CASE_CHECKOUT={shlex.quote(str(case_checkout))}",
-                'exec bun "$CASE_CHECKOUT/src/index.ts" "$@"',
+                f"CASE_COMMAND={shlex.quote(case_command)}",
+                'exec "$CASE_COMMAND" "$CASE_CHECKOUT/src/index.ts" "$@"',
                 "",
             ]
         ),
@@ -1003,6 +1512,138 @@ def write_case_cli_shim(*, state_dir: Path, case_checkout: Path) -> Path:
     )
     shim_path.chmod(0o755)
     return shim_path
+
+
+def case_cli_shim_path(state_dir: Path) -> Path:
+    return state_dir / "case-bin" / "ca"
+
+
+def resolve_case_command(case_command: str | None) -> str | None:
+    if case_command is not None:
+        return shutil.which(os.path.expanduser(case_command))
+
+    path_command = shutil.which(DEFAULT_CASE_COMMAND)
+    if path_command is not None:
+        return path_command
+
+    home_bun = Path.home() / ".bun" / "bin" / "bun"
+    if home_bun.is_file() and os.access(home_bun, os.X_OK):
+        return str(home_bun)
+    return None
+
+
+def github_pr_preflight_failure(
+    *, target_repo: str, env: dict[str, str] | None = None
+) -> GithubPrPreflightFailure | None:
+    preflight_env = dict(env or os.environ)
+    preflight_env["GH_PROMPT_DISABLED"] = "1"
+    gh_command = shutil.which("gh", path=preflight_env.get("PATH"))
+    if gh_command is None:
+        return GithubPrPreflightFailure(
+            kind="missing-gh",
+            message=(
+                "missing gh executable; install GitHub CLI and make it available "
+                "on PATH before using --close-bead-on-success"
+            ),
+        )
+
+    auth_result = run_github_pr_preflight_command(
+        [gh_command, "auth", "status"],
+        env=preflight_env,
+    )
+    if auth_result.returncode != 0:
+        detail = github_preflight_detail(auth_result, env=preflight_env)
+        message = (
+            "unauthenticated gh or missing required GitHub token; run `gh auth "
+            "login` or set GH_TOKEN/GITHUB_TOKEN with repo access"
+        )
+        if detail:
+            message = f"{message}. gh auth status: {detail}"
+        return GithubPrPreflightFailure(kind="unauthenticated-gh", message=message)
+
+    repo_result = run_github_pr_preflight_command(
+        [gh_command, "repo", "view", target_repo, "--json", "nameWithOwner"],
+        env=preflight_env,
+    )
+    if repo_result.returncode != 0:
+        detail = github_preflight_detail(repo_result, env=preflight_env)
+        message = (
+            f"missing remote permissions for {target_repo}; ensure the repository "
+            "exists and gh/GH_TOKEN/GITHUB_TOKEN can access it"
+        )
+        if detail:
+            message = f"{message}. gh repo view: {detail}"
+        return GithubPrPreflightFailure(kind="missing-remote-permissions", message=message)
+
+    return None
+
+
+def run_github_pr_preflight_command(
+    command: list[str], *, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        return subprocess.CompletedProcess(command, 1, "", str(error))
+
+
+def github_preflight_detail(
+    result: subprocess.CompletedProcess[str], *, env: dict[str, str] | None = None
+) -> str:
+    detail = (result.stderr or result.stdout).strip()
+    detail = redact_text(
+        detail,
+        github_token_redactions(env or os.environ),
+    )
+    detail = " ".join(detail.split())
+    if len(detail) > 400:
+        return detail[:397] + "..."
+    return detail
+
+
+def github_token_redactions(env: dict[str, str]) -> list[str]:
+    return [env[key] for key in GITHUB_TOKEN_ENV_KEYS if env.get(key)]
+
+
+def case_command_redactions(
+    codex_session: CaseCodexSession | None,
+) -> list[str]:
+    redactions = github_token_redactions(os.environ)
+    if codex_session is not None:
+        redactions.append(codex_session.access_token)
+    return redactions
+
+
+def write_github_pr_preflight_failure(
+    *,
+    run_dir: Path,
+    target_repo: str,
+    failure: GithubPrPreflightFailure,
+) -> Path:
+    result_path = run_dir / "github-pr-preflight.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "ok": False,
+                "target_repo": target_repo,
+                "failure_kind": failure.kind,
+                "failure": failure.message,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return result_path
 
 
 def write_pi_codex_models_config(codex_session: CaseCodexSession) -> Path:
@@ -1062,6 +1703,9 @@ def write_execution_request(
     target_source_checkout: Path | None = None,
     target_worktree_checkout: Path | None = None,
     codex_session: CaseCodexSession | None = None,
+    workstream_seed_ref: str | None = None,
+    workstream_seed_commit: str | None = None,
+    run_dir: Path | None = None,
 ) -> Path:
     metadata = issue["metadata"]
     validation_command = redact_sensitive_text(str(metadata["validation_command"]))
@@ -1069,52 +1713,96 @@ def write_execution_request(
         str(metadata["target_repo_path"])
     ).resolve()
     checkout_path = target_checkout_path or source_checkout
-    run_dir = state_dir / "runs" / make_run_id(str(issue["id"]))
+    run_dir = run_dir or state_dir / "runs" / make_run_id(str(issue["id"]))
     run_dir.mkdir(parents=True, exist_ok=True)
     request_path = run_dir / "execution-request.json"
+    payload: dict[str, Any] = {
+        "bead_id": issue["id"],
+        "case_checkout": str(case_checkout),
+        "case_cli_shim": str(case_cli_shim),
+        "case_data_dir": str(case_data_dir),
+        "case_dry_run": case_dry_run,
+        "case_runtime_module": (
+            str(case_runtime_module) if case_runtime_module is not None else None
+        ),
+        "case_codex_session": case_codex_session_metadata(codex_session),
+        "case_task_json": str(task_json),
+        "case_task_markdown": str(task_md),
+        "target_checkout_mode": target_checkout_mode,
+        "target_checkout_path": str(checkout_path),
+        "target_repo": metadata["target_repo"],
+        "target_repo_path": metadata["target_repo_path"],
+        "target_source_checkout": str(source_checkout),
+        "target_worktree_checkout": (
+            str(target_worktree_checkout)
+            if target_worktree_checkout is not None
+            else None
+        ),
+        "target_base_branch": metadata["target_base_branch"],
+        "review_branch": review_branch,
+        "validation_command": validation_command,
+        "sandcastle_runtime_adapter": {
+            "status": "scaffolded",
+            "interface": "CaseAgentRuntime",
+            "normal_sandcastle_entrypoint": (
+                "run({ agent, sandbox, cwd, branchStrategy, "
+                "prompt, logging })"
+            ),
+        },
+    }
+    worker_metadata = validation_worker_execution_metadata(
+        metadata=metadata,
+        validation_command=validation_command,
+    )
+    if worker_metadata is not None:
+        payload["validation_worker"] = worker_metadata
+    if workstream_seed_ref is not None:
+        payload["workstream_seed_ref"] = workstream_seed_ref
+        payload["workstream_seed_commit"] = workstream_seed_commit
+    if "target_repo_metadata" in metadata:
+        payload["target_repo_metadata"] = metadata["target_repo_metadata"]
+    if isinstance(metadata.get("target_repo_resolution"), dict):
+        payload["target_repo_resolution"] = metadata["target_repo_resolution"]
     request_path.write_text(
-        json.dumps(
-            {
-                "bead_id": issue["id"],
-                "case_checkout": str(case_checkout),
-                "case_cli_shim": str(case_cli_shim),
-                "case_data_dir": str(case_data_dir),
-                "case_dry_run": case_dry_run,
-                "case_runtime_module": (
-                    str(case_runtime_module) if case_runtime_module is not None else None
-                ),
-                "case_codex_session": case_codex_session_metadata(codex_session),
-                "case_task_json": str(task_json),
-                "case_task_markdown": str(task_md),
-                "target_checkout_mode": target_checkout_mode,
-                "target_checkout_path": str(checkout_path),
-                "target_repo": metadata["target_repo"],
-                "target_repo_path": metadata["target_repo_path"],
-                "target_source_checkout": str(source_checkout),
-                "target_worktree_checkout": (
-                    str(target_worktree_checkout)
-                    if target_worktree_checkout is not None
-                    else None
-                ),
-                "target_base_branch": metadata["target_base_branch"],
-                "review_branch": review_branch,
-                "validation_command": validation_command,
-                "sandcastle_runtime_adapter": {
-                    "status": "scaffolded",
-                    "interface": "CaseAgentRuntime",
-                    "normal_sandcastle_entrypoint": (
-                        "run({ agent, sandbox, cwd, branchStrategy, "
-                        "prompt, logging })"
-                    ),
-                },
-            },
-            indent=2,
-            sort_keys=True,
-        )
+        json.dumps(payload, indent=2, sort_keys=True)
         + "\n",
         encoding="utf-8",
     )
     return request_path
+
+
+def validation_worker_execution_metadata(
+    *, metadata: dict[str, Any], validation_command: str
+) -> dict[str, Any] | None:
+    request_path = metadata.get("validation_worker_request_path")
+    evidence_dir = metadata.get("validation_worker_evidence_dir")
+    if not request_path or not evidence_dir:
+        return None
+    return {
+        "request_path": str(request_path),
+        "generated_command": validation_command,
+        "evidence_dir": str(evidence_dir),
+        "profile": worker_metadata_value(
+            metadata,
+            flat_keys="validation_profile",
+            worker_keys="profile",
+        ),
+        "timeout_seconds": worker_metadata_value(
+            metadata,
+            flat_keys="validation_timeout_seconds",
+            worker_keys="timeout_seconds",
+        ),
+        "ref": worker_metadata_value(
+            metadata,
+            flat_keys="validation_ref",
+            worker_keys="ref",
+        ),
+        "commit": worker_metadata_value(
+            metadata,
+            flat_keys="validation_commit",
+            worker_keys="commit",
+        ),
+    }
 
 
 def case_codex_session_metadata(
@@ -1142,27 +1830,11 @@ def run_case_command(
     case_runtime_module: Path | None,
     codex_session: CaseCodexSession | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    for key in (
-        "BEADS_DIR",
-        "BEADS_DOLT_PASSWORD",
-        "AUTOMATION_BEADS_WORKSPACE",
-        "OPENAI_API_KEY",
-        "PI_CODING_AGENT_DIR",
-    ):
-        env.pop(key, None)
-    env["CASE_DATA_DIR"] = str(case_data_dir)
-    env["XDG_CONFIG_HOME"] = str(case_data_dir / "config-home")
-    env["HOME"] = str(case_data_dir / "home")
-    inherited_path = env.get("PATH")
-    env["PATH"] = (
-        f"{case_cli_shim.parent}{os.pathsep}{inherited_path}"
-        if inherited_path
-        else str(case_cli_shim.parent)
+    env = build_case_command_env(
+        case_data_dir=case_data_dir,
+        case_cli_shim=case_cli_shim,
+        codex_session=codex_session,
     )
-    if codex_session is not None:
-        env["OPENAI_API_KEY"] = codex_session.access_token
-        env["PI_CODING_AGENT_DIR"] = str(codex_session.pi_config_dir)
     command = [
         case_command,
         "src/index.ts",
@@ -1185,6 +1857,63 @@ def run_case_command(
         stderr=subprocess.PIPE,
         check=False,
     )
+
+
+def build_case_command_env(
+    *,
+    case_data_dir: Path,
+    case_cli_shim: Path,
+    codex_session: CaseCodexSession | None = None,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in CASE_ENV_REMOVED_KEYS:
+        env.pop(key, None)
+    env["CASE_DATA_DIR"] = str(case_data_dir)
+    env["XDG_CONFIG_HOME"] = str(case_data_dir / "config-home")
+    env["HOME"] = str(case_data_dir / "home")
+    env["GH_PROMPT_DISABLED"] = "1"
+    inherited_path = env.get("PATH")
+    env["PATH"] = (
+        f"{case_cli_shim.parent}{os.pathsep}{inherited_path}"
+        if inherited_path
+        else str(case_cli_shim.parent)
+    )
+    if codex_session is not None:
+        env["OPENAI_API_KEY"] = codex_session.access_token
+        env["PI_CODING_AGENT_DIR"] = str(codex_session.pi_config_dir)
+    return env
+
+
+def archive_case_artifacts(
+    *,
+    run_dir: Path,
+    target_repo: Path,
+    redactions: list[str] | None = None,
+) -> Path | None:
+    case_dir = target_repo / ".case"
+    if not case_dir.exists():
+        return None
+    archive_dir = run_dir / "case-artifacts" / ".case"
+    if archive_dir.exists():
+        shutil.rmtree(archive_dir)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for source in sorted(case_dir.rglob("*")):
+        relative = source.relative_to(case_dir)
+        destination = archive_dir / relative
+        if source.is_symlink():
+            continue
+        if source.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            destination.write_text(
+                redact_text(source.read_text(encoding="utf-8"), redactions),
+                encoding="utf-8",
+            )
+        except UnicodeDecodeError:
+            shutil.copy2(source, destination)
+    return archive_dir
 
 
 def write_case_command_result(
