@@ -8,6 +8,9 @@ WORKER_METADATA_KEYS = {
     "validation_worker",
     "validation_worker_command",
     "worker_command",
+    "validation_worker_local_command",
+    "validation_worker_remote_command",
+    "validation_worker_transport",
     "validation_profile",
     "validation_timeout_seconds",
     "validation_repo",
@@ -38,12 +41,14 @@ def is_worker_validation_requested(metadata: dict[str, Any]) -> bool:
 def worker_validation_command(metadata: dict[str, Any]) -> str | None:
     worker = metadata.get("validation_worker")
     if isinstance(worker, dict):
-        for key in ("worker_command", "command"):
+        transport = normalized_transport(worker.get("transport"))
+        for key in worker_command_keys(transport):
             command = normalized_command(worker.get(key))
             if command is not None:
                 return command
 
-    for key in ("validation_worker_command", "worker_command"):
+    transport = normalized_transport(metadata.get("validation_worker_transport"))
+    for key in worker_command_keys(transport, flat=True):
         command = normalized_command(metadata.get(key))
         if command is not None:
             return command
@@ -70,6 +75,42 @@ def worker_metadata_value(
             if key in worker:
                 return worker[key]
     return default
+
+
+def worker_validation_transport(metadata: dict[str, Any]) -> str:
+    worker = metadata.get("validation_worker")
+    if isinstance(worker, dict):
+        transport = normalized_transport(worker.get("transport"))
+        if transport is not None:
+            return transport
+    return normalized_transport(metadata.get("validation_worker_transport")) or "local"
+
+
+def worker_command_keys(
+    transport: str | None,
+    *,
+    flat: bool = False,
+) -> tuple[str, ...]:
+    if transport == "remote":
+        return (
+            ("validation_worker_remote_command", "validation_worker_command", "worker_command")
+            if flat
+            else ("remote_command", "dispatch_command", "worker_command", "command")
+        )
+    return (
+        ("validation_worker_local_command", "validation_worker_command", "worker_command")
+        if flat
+        else ("local_command", "worker_command", "command")
+    )
+
+
+def normalized_transport(value: Any) -> str | None:
+    transport = normalized_command(value)
+    if transport in ("remote", "ssh", "dispatch"):
+        return "remote"
+    if transport in ("local", None):
+        return transport
+    return str(transport)
 
 
 def normalized_command(value: Any) -> str | None:

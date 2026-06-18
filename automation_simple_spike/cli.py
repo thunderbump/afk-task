@@ -29,6 +29,7 @@ from .validation_metadata import (
     is_worker_validation_requested,
     worker_metadata_value,
     worker_validation_command,
+    worker_validation_transport,
 )
 from .worktree import (
     WorktreeProvisioningError,
@@ -951,9 +952,45 @@ def compile_validation_metadata(
         target_worktree_checkout=target_worktree_checkout,
         run_dir=run_dir,
     )
-    compiled = f"{command} --request {shlex.quote(str(request_path))}"
+    transport = worker_validation_transport(metadata)
+    if uses_validation_worker_adapter(metadata):
+        timeout = worker_metadata_value(
+            metadata,
+            flat_keys="validation_timeout_seconds",
+            worker_keys="timeout_seconds",
+        )
+        timeout_arg = (
+            f" --timeout-seconds {shlex.quote(str(timeout))}"
+            if timeout not in (None, "")
+            else ""
+        )
+        compiled = (
+            "python3 -m automation_simple_spike.validation_worker_adapter"
+            f" --transport {shlex.quote(transport)}"
+            f" --command {shlex.quote(command)}"
+            f" --request {shlex.quote(str(request_path))}"
+            f"{timeout_arg}"
+        )
+    else:
+        compiled = f"{command} --request {shlex.quote(str(request_path))}"
     metadata["validation_command"] = compiled
     return compiled
+
+
+def uses_validation_worker_adapter(metadata: dict[str, Any]) -> bool:
+    worker = metadata.get("validation_worker")
+    if isinstance(worker, dict) and any(
+        key in worker for key in ("transport", "local_command", "remote_command", "dispatch_command")
+    ):
+        return True
+    return any(
+        key in metadata
+        for key in (
+            "validation_worker_transport",
+            "validation_worker_local_command",
+            "validation_worker_remote_command",
+        )
+    )
 
 
 def write_validation_worker_request(

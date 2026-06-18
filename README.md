@@ -308,7 +308,11 @@ The container image does not currently install or configure `bd`, so central
 Beads runs need either a fixture JSON via `--bead-json` or a later explicit
 Beads workspace/CLI mount. Live Codex-session runs likewise need an explicit
 read-only auth mount plus `--case-codex-session --codex-auth-file <mounted-path>`.
-For `run-workstream`, keep live Codex/container proofs as `ready-for-human` or
+Worker-backed validation does not require mounting the host Docker socket by
+default: the container only generates the portable worker request JSON and Case
+check command. Any AkkStack, Docker, SSH, or job-dispatch access belongs to the
+configured validation worker command/transport outside the Case container. For
+`run-workstream`, keep live Codex/container proofs as `ready-for-human` or
 blocked follow-up work until they are suitable for ordinary AFK execution.
 
 For a no-network synthetic proof, mount a temp directory containing the target
@@ -462,8 +466,17 @@ Keep coverage for these runtime semantics:
   target repo cwd when the generated command runs.
 - The worker sees the target repo as `cwd` and can read the generated request
   payload.
+- Metadata with `validation_worker.transport: local` or `remote` compiles
+  through `automation_simple_spike.validation_worker_adapter`, which appends the
+  same `--request` payload to the configured local command or remote dispatch
+  command. The adapter strips Beads, Codex, and Pi secret environment variables,
+  reports missing local commands, remote dispatch failures, worker nonzero exits,
+  timeouts, and missing evidence as distinct `failure_category` values in
+  `validation-evidence/result.json`.
 
-`tests/test_run_bead_cli.py` contains the worker-backed fixture for this shape.
+`tests/test_run_bead_cli.py`, `tests/test_validation_metadata.py`, and
+`tests/test_validation_worker_adapter.py` contain the worker-backed fixtures for
+this shape.
 
 ## Cron Shape
 
