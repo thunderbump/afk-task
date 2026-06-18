@@ -281,6 +281,171 @@ class WorkstreamSelectionTest(unittest.TestCase):
                 ],
             )
 
+    def test_command_resolves_external_parent_child_blocker_statuses_from_fake_bd(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            beads_workspace = tmp_path / "beads"
+            beads_workspace.mkdir()
+            password_file = beads_workspace / "dolt_beads_password.txt"
+            password_file.write_text("dummy-password\n", encoding="utf-8")
+
+            show_payload = [
+                {
+                    "id": "central-6lt",
+                    "title": "Validation worker workstream",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "type:prd"],
+                }
+            ]
+            children_payload = [
+                {
+                    "id": "central-6lt.1",
+                    "title": "Closed external blocker child",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "metadata": runnable_metadata(),
+                    "parent": "central-6lt",
+                    "dependencies": [
+                        {
+                            "issue_id": "central-6lt.1",
+                            "depends_on_id": "central-6lt",
+                            "type": "parent-child",
+                        },
+                        {
+                            "issue_id": "central-6lt.1",
+                            "depends_on_id": "central-byy",
+                            "type": "blocks",
+                        },
+                    ],
+                },
+                {
+                    "id": "central-6lt.2",
+                    "title": "Open external blocker child",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "metadata": runnable_metadata(),
+                    "parent": "central-6lt",
+                    "dependencies": [
+                        {
+                            "issue_id": "central-6lt.2",
+                            "depends_on_id": "central-6lt",
+                            "type": "parent-child",
+                        },
+                        {
+                            "issue_id": "central-6lt.2",
+                            "depends_on_id": "central-open",
+                            "type": "blocks",
+                        },
+                    ],
+                },
+                {
+                    "id": "central-6lt.3",
+                    "title": "Parent-child only child",
+                    "status": "open",
+                    "labels": ["project:bump-eqemu", "ready-for-agent"],
+                    "metadata": runnable_metadata(),
+                    "parent": "central-6lt",
+                    "dependencies": [
+                        {
+                            "issue_id": "central-6lt.3",
+                            "depends_on_id": "central-6lt",
+                            "type": "parent-child",
+                        }
+                    ],
+                },
+            ]
+            blocker_payloads = {
+                "central-byy": [
+                    {
+                        "id": "central-byy",
+                        "title": "Closed external blocker",
+                        "status": "closed",
+                        "labels": ["project:automation-simple-spike"],
+                    }
+                ],
+                "central-open": [
+                    {
+                        "id": "central-open",
+                        "title": "Open external blocker",
+                        "status": "open",
+                        "labels": ["project:automation-simple-spike"],
+                    }
+                ],
+            }
+            payloads_path = tmp_path / "bd-payloads.json"
+            payloads_path.write_text(
+                json.dumps(
+                    {
+                        "show": show_payload,
+                        "children": children_payload,
+                        "blockers": blocker_payloads,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calls_path = tmp_path / "bd-calls.json"
+            fake_bd = tmp_path / "fake-bd"
+            fake_bd.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import json, os, sys",
+                        "from pathlib import Path",
+                        "calls_path = Path(os.environ['FAKE_BD_CALLS'])",
+                        "calls = json.loads(calls_path.read_text(encoding='utf-8')) if calls_path.exists() else []",
+                        "calls.append(sys.argv[1:])",
+                        "calls_path.write_text(json.dumps(calls) + '\\n', encoding='utf-8')",
+                        "payloads = json.loads(Path(os.environ['FAKE_BD_PAYLOADS']).read_text(encoding='utf-8'))",
+                        "if sys.argv[1:] == ['show', 'central-6lt', '--json']:",
+                        "    print(json.dumps(payloads['show']))",
+                        "elif sys.argv[1:] == ['children', 'central-6lt', '--json']:",
+                        "    print(json.dumps(payloads['children']))",
+                        "elif sys.argv[1:2] == ['show'] and sys.argv[3:] == ['--json'] and sys.argv[2] in payloads['blockers']:",
+                        "    print(json.dumps(payloads['blockers'][sys.argv[2]]))",
+                        "else:",
+                        "    print(f'unexpected bd args: {sys.argv[1:]}', file=sys.stderr)",
+                        "    raise SystemExit(2)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_bd.chmod(0o755)
+
+            result = run_cli(
+                "select-workstream",
+                "--parent",
+                "central-6lt",
+                "--json",
+                "--bd-command",
+                str(fake_bd),
+                "--beads-workspace",
+                str(beads_workspace),
+                "--beads-password-file",
+                str(password_file),
+                env={
+                    "FAKE_BD_CALLS": str(calls_path),
+                    "FAKE_BD_PAYLOADS": str(payloads_path),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            selected = json.loads(result.stdout)
+            self.assertEqual(
+                [issue["id"] for issue in selected],
+                ["central-6lt.1", "central-6lt.3"],
+            )
+            self.assertEqual(
+                json.loads(calls_path.read_text(encoding="utf-8")),
+                [
+                    ["show", "central-6lt", "--json"],
+                    ["children", "central-6lt", "--json"],
+                    ["show", "central-byy", "--json"],
+                    ["show", "central-open", "--json"],
+                ],
+            )
+
     def test_command_lists_runnable_beads_by_workstream_id(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
